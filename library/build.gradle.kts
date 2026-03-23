@@ -1,4 +1,142 @@
 import com.android.build.api.dsl.LibraryExtension
+import org.gradle.api.DefaultTask
+import org.gradle.api.GradleException
+import org.gradle.api.file.DirectoryProperty
+import org.gradle.api.file.RegularFileProperty
+import org.gradle.api.provider.Property
+import org.gradle.api.tasks.Input
+import org.gradle.api.tasks.InputDirectory
+import org.gradle.api.tasks.OutputDirectory
+import org.gradle.api.tasks.OutputFile
+import org.gradle.api.tasks.PathSensitive
+import org.gradle.api.tasks.PathSensitivity
+import org.gradle.api.tasks.TaskAction
+import org.gradle.process.ExecOperations
+import java.io.ByteArrayOutputStream
+import javax.inject.Inject
+
+abstract class ConfigureLlamaCmakeTask : DefaultTask() {
+    @get:Input
+    abstract val cmakePath: Property<String>
+
+    @get:InputDirectory
+    @get:PathSensitive(PathSensitivity.ABSOLUTE)
+    abstract val sourceDir: DirectoryProperty
+
+    @get:OutputDirectory
+    abstract val buildDir: DirectoryProperty
+
+    @get:Input
+    abstract val archName: Property<String>
+
+    @get:Input
+    abstract val sdkName: Property<String>
+
+    @get:Input
+    abstract val minIos: Property<String>
+
+    @get:Input
+    abstract val pathEnv: Property<String>
+
+    @get:Inject
+    abstract val execOperations: ExecOperations
+
+    @TaskAction
+    fun configure() {
+        val sdk = when (sdkName.get()) {
+            "iPhoneSimulator" -> "iphonesimulator"
+            "iPhoneOS" -> "iphoneos"
+            else -> "macosx"
+        }
+
+        val sdkPathOutput = ByteArrayOutputStream()
+        execOperations.exec {
+            executable = "xcrun"
+            args("--sdk", sdk, "--show-sdk-path")
+            standardOutput = sdkPathOutput
+        }
+        val sdkPath = sdkPathOutput.toString().trim()
+
+        val sourceDirFile = sourceDir.get().asFile
+        val buildDirFile = buildDir.get().asFile
+        val systemName = if (sdk == "macosx") "Darwin" else "iOS"
+
+        buildDirFile.mkdirs()
+
+        execOperations.exec {
+            executable = cmakePath.get()
+            environment("PATH", pathEnv.get())
+            args(
+                "-S", sourceDirFile.absolutePath,
+                "-B", buildDirFile.absolutePath,
+                "-DCMAKE_SYSTEM_NAME=$systemName",
+                "-DCMAKE_OSX_ARCHITECTURES=${archName.get()}",
+                "-DCMAKE_OSX_SYSROOT=$sdkPath",
+                "-DCMAKE_OSX_DEPLOYMENT_TARGET=${minIos.get()}",
+                "-DCMAKE_INSTALL_PREFIX=${buildDirFile.resolve("install").absolutePath}",
+                "-DCMAKE_IOS_INSTALL_COMBINED=NO",
+                "-DCMAKE_BUILD_TYPE=Release",
+                "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+                "-DGGML_OPENMP=OFF",
+                "-DLLAMA_CURL=OFF",
+                if (sdk == "iphonesimulator") "-DLLAMA_BUILD_BERT=ON" else "-DLLAMA_BUILD_BERT=OFF",
+                if (sdk == "iphonesimulator") "-DLLAMA_BUILD_EMBEDDERS=ON" else "-DLLAMA_BUILD_EMBEDDERS=OFF",
+            )
+        }
+    }
+}
+
+abstract class MergeLlamaStaticTask : DefaultTask() {
+    @get:Input
+    abstract val libtoolPath: Property<String>
+
+    @get:InputDirectory
+    @get:PathSensitive(PathSensitivity.ABSOLUTE)
+    abstract val libDir: DirectoryProperty
+
+    @get:OutputFile
+    abstract val mergedLib: RegularFileProperty
+
+    @get:Inject
+    abstract val execOperations: ExecOperations
+
+    @TaskAction
+    fun merge() {
+        val libRoot = libDir.get().asFile
+        val libPath = libRoot.absolutePath
+
+        val whisperCandidates = listOf(
+            libRoot.resolve("whisper/src/libwhisper.a"),
+            libRoot.resolve("whisper/libwhisper.a"),
+            libRoot.resolve("whisper-build/src/libwhisper.a"),
+            libRoot.resolve("whisper-build/libwhisper.a")
+        )
+
+        val args = mutableListOf(
+            "-static",
+            "-o", mergedLib.get().asFile.absolutePath,
+            "$libPath/libllama_static.a",
+            "$libPath/llama-local-build/src/libllama.a",
+            "$libPath/llama-local-build/ggml/src/libggml.a",
+            "$libPath/llama-local-build/ggml/src/libggml-base.a",
+            "$libPath/llama-local-build/ggml/src/libggml-cpu.a",
+            "$libPath/llama-local-build/ggml/src/ggml-blas/libggml-blas.a",
+            "$libPath/llama-local-build/ggml/src/ggml-metal/libggml-metal.a"
+        )
+
+        val whisperLib = whisperCandidates.firstOrNull { it.exists() }
+        if (whisperLib != null) {
+            args += whisperLib.absolutePath
+        } else {
+            logger.warn("Whisper static library not found in $libPath. iOS voice/STT symbols will NOT be linked.")
+        }
+
+        execOperations.exec {
+            executable = libtoolPath.get()
+            args(args)
+        }
+    }
+}
 
 plugins {
     alias(libs.plugins.kotlinMultiplatform)
@@ -14,7 +152,7 @@ group = "com.llamatik"
 version = (System.getenv("RELEASE_VERSION") ?: "0.0.0-SNAPSHOT")
 
 // Choose ONE min iOS version and use it everywhere
-val minIos = "16.6"
+val minIosVersion = "16.6"
 
 kotlin {
     // ---- ANDROID target MUST publish a library variant (AAR) ----
@@ -62,64 +200,37 @@ kotlin {
     }
 
     // Resolve tools once
-    val cmakePath = findTool("cmake")
-    val libtoolPath = findTool("libtool") // should be /usr/bin/libtool on macOS
+    val cmakeExecutablePath = findTool("cmake")
+    val libtoolExecutablePath = findTool("libtool") // should be /usr/bin/libtool on macOS
+    val toolPathEnv = "/opt/homebrew/bin:${System.getenv("PATH") ?: ""}"
 
     listOf(
         Triple(iosX64(), "x86_64", "iPhoneSimulator"),
         Triple(iosArm64(), "arm64", "iPhoneOS"),
         Triple(iosSimulatorArm64(), "arm64", "iPhoneSimulator")
-    ).forEach { (arch, archName, sdkName) ->
-        val cmakeBuildDir = layout.buildDirectory
-            .dir("llama-cmake/$sdkName/${arch.name}")
-            .get()
-            .asFile
+    ).forEach { (arch, archValue, sdkValue) ->
+        val cmakeBuildDirProvider = layout.buildDirectory.dir("llama-cmake/$sdkValue/${arch.name}")
+        val cmakeBuildDir = cmakeBuildDirProvider.get().asFile
         val buildTaskName = "buildLlamaCMake${arch.name.replaceFirstChar { it.uppercase() }}"
 
-        tasks.register(buildTaskName, Exec::class) {
-            doFirst {
-                val sourceDir = projectDir.resolve("cmake/llama-wrapper")
-                val buildDir = cmakeBuildDir
-                val sdk = when (sdkName) {
-                    "iPhoneSimulator" -> "iphonesimulator"
-                    "iPhoneOS" -> "iphoneos"
-                    else -> "macosx"
-                }
-                val sdkPathProvider = providers.exec {
-                    commandLine("xcrun", "--sdk", sdk, "--show-sdk-path")
-                }.standardOutput.asText.map { it.trim() }
-                val systemName = if (sdk == "macosx") "Darwin" else "iOS"
-                cmakeBuildDir.mkdirs()
-                environment("PATH", "/opt/homebrew/bin:" + System.getenv("PATH"))
-
-                commandLine = listOf(
-                    cmakePath,
-                    "-S", sourceDir.absolutePath,
-                    "-B", buildDir.absolutePath,
-                    "-DCMAKE_SYSTEM_NAME=$systemName",
-                    "-DCMAKE_OSX_ARCHITECTURES=$archName",
-                    "-DCMAKE_OSX_SYSROOT=${sdkPathProvider.get()}",
-                    "-DCMAKE_OSX_DEPLOYMENT_TARGET=$minIos",
-                    "-DCMAKE_INSTALL_PREFIX=${buildDir.resolve("install")}",
-                    "-DCMAKE_IOS_INSTALL_COMBINED=NO",
-                    "-DCMAKE_BUILD_TYPE=Release",
-                    "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
-                    "-DGGML_OPENMP=OFF",
-                    "-DLLAMA_CURL=OFF",
-                    if (sdk == "iphonesimulator") "-DLLAMA_BUILD_BERT=ON" else "-DLLAMA_BUILD_BERT=OFF",
-                    if (sdk == "iphonesimulator") "-DLLAMA_BUILD_EMBEDDERS=ON" else "-DLLAMA_BUILD_EMBEDDERS=OFF",
-                )
-            }
+        val buildTask = tasks.register(buildTaskName, ConfigureLlamaCmakeTask::class) {
+            cmakePath.set(cmakeExecutablePath)
+            sourceDir.set(layout.projectDirectory.dir("cmake/llama-wrapper"))
+            buildDir.set(cmakeBuildDirProvider)
+            archName.set(archValue)
+            sdkName.set(sdkValue)
+            minIos.set(minIosVersion)
+            pathEnv.set(toolPathEnv)
         }
 
         val compileTask = tasks.register(
             "compileLlamaCMake${arch.name.replaceFirstChar { it.uppercase() }}",
             Exec::class
         ) {
-            dependsOn(buildTaskName)
-            environment("PATH", "/opt/homebrew/bin:" + System.getenv("PATH"))
-            commandLine = listOf(
-                cmakePath,
+            dependsOn(buildTask)
+            environment("PATH", toolPathEnv)
+            executable = cmakeExecutablePath
+            args(
                 "--build", cmakeBuildDir.absolutePath,
                 "--target", "llama_static_wrapper",
                 "--verbose"
@@ -130,41 +241,12 @@ kotlin {
 
         val mergeTask = tasks.register(
             "mergeLlamaStatic${arch.name.replaceFirstChar { it.uppercase() }}",
-            Exec::class
+            MergeLlamaStaticTask::class
         ) {
             dependsOn(compileTask)
-
-            doFirst {
-                // ---- Add whisper into the merged archive (so the symbols exist at link time) ----
-                val whisperCandidates = listOf(
-                    "$libPath/whisper/src/libwhisper.a",
-                    "$libPath/whisper/libwhisper.a",
-                    "$libPath/whisper-build/src/libwhisper.a",
-                    "$libPath/whisper-build/libwhisper.a"
-                )
-
-                val whisperLib = whisperCandidates.firstOrNull { file(it).exists() }
-
-                val args = mutableListOf(
-                    libtoolPath, "-static",
-                    "-o", "$libPath/libllama_merged.a",
-                    "$libPath/libllama_static.a",
-                    "$libPath/llama-local-build/src/libllama.a",
-                    "$libPath/llama-local-build/ggml/src/libggml.a",
-                    "$libPath/llama-local-build/ggml/src/libggml-base.a",
-                    "$libPath/llama-local-build/ggml/src/libggml-cpu.a",
-                    "$libPath/llama-local-build/ggml/src/ggml-blas/libggml-blas.a",
-                    "$libPath/llama-local-build/ggml/src/ggml-metal/libggml-metal.a"
-                )
-
-                if (whisperLib != null) {
-                    args += whisperLib
-                } else {
-                    logger.warn("Whisper static library not found in $libPath. iOS voice/STT symbols will NOT be linked.")
-                }
-
-                commandLine(args)
-            }
+            libtoolPath.set(libtoolExecutablePath)
+            libDir.set(cmakeBuildDirProvider)
+            mergedLib.set(layout.buildDirectory.file("llama-cmake/$sdkValue/${arch.name}/libllama_merged.a"))
         }
 
         // Ensure cinterop runs after the native libs are built/merged
@@ -219,10 +301,10 @@ kotlin {
                 "-framework", "Accelerate",
                 "-framework", "Metal",
                 "-Wl,-no_implicit_dylibs",
-                if (sdkName.contains("Simulator"))
-                    "-mios-simulator-version-min=$minIos"
+                if (sdkValue.contains("Simulator"))
+                    "-mios-simulator-version-min=$minIosVersion"
                 else
-                    "-mios-version-min=$minIos"
+                    "-mios-version-min=$minIosVersion"
             )
         }
         arch.binaries.getFramework("RELEASE").apply {
@@ -234,10 +316,10 @@ kotlin {
                 "-framework", "Accelerate",
                 "-framework", "Metal",
                 "-Wl,-no_implicit_dylibs",
-                if (sdkName.contains("Simulator"))
-                    "-mios-simulator-version-min=$minIos"
+                if (sdkValue.contains("Simulator"))
+                    "-mios-simulator-version-min=$minIosVersion"
                 else
-                    "-mios-version-min=$minIos"
+                    "-mios-version-min=$minIosVersion"
             )
         }
     }
@@ -276,7 +358,7 @@ kotlin {
             desktopJniBuildDir.mkdirs()
 
             val args = mutableListOf(
-                cmakePath,
+                cmakeExecutablePath,
                 "-S", desktopJniSourceDir.absolutePath,
                 "-B", desktopJniBuildDir.absolutePath,
                 "-DCMAKE_BUILD_TYPE=Release"
@@ -297,7 +379,7 @@ kotlin {
         dependsOn(buildLlamaJniDesktop)
 
         commandLine(
-            cmakePath,
+            cmakeExecutablePath,
             "--build", desktopJniBuildDir.absolutePath,
             "--config", "Release"
         )
