@@ -451,6 +451,9 @@ extensions.configure<LibraryExtension> {
         externalNativeBuild {
             cmake {
                 arguments += listOf(
+                    "-DCMAKE_BUILD_TYPE=Release",
+                    "-DCMAKE_MESSAGE_LOG_LEVEL=DEBUG",
+                    "-DCMAKE_VERBOSE_MAKEFILE=ON",
                     "-DBUILD_SHARED_LIBS=ON",
                     "-DLLAMA_BUILD_COMMON=ON",
                     "-DLLAMA_OPENSSL=OFF",

@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <system_error>
 #include <cerrno>
+#include <chrono>
 #include <unistd.h>
 
 // ===================================================================================
@@ -64,6 +65,9 @@ static int emb_dim = 0;
 // Text generation
 static struct llama_model *gen_model = nullptr;
 static struct llama_context *gen_ctx = nullptr;
+static llama_batch g_step_batch = {};
+static bool g_step_batch_inited = false;
+static std::vector<llama_token> g_cached_prompt_tokens;
 
 // Backend lifetime
 static bool g_backend_inited = false;
@@ -91,6 +95,24 @@ static int compute_android_inference_threads() {
     const int guessed = static_cast<int>(cpu_count > 0 ? cpu_count : N_THREADS_MAX) - N_THREADS_HEADROOM;
     const int n_threads = std::max(N_THREADS_MIN, std::min(N_THREADS_MAX, guessed));
     return n_threads;
+}
+
+static void ensure_step_batch_ready() {
+    if (!g_step_batch_inited) {
+        g_step_batch = llama_batch_init(1, 0, 1);
+        g_step_batch_inited = true;
+    }
+}
+
+static void free_step_batch_if_needed() {
+    if (g_step_batch_inited) {
+        llama_batch_free(g_step_batch);
+        g_step_batch_inited = false;
+    }
+}
+
+static void reset_generation_prompt_cache() {
+    g_cached_prompt_tokens.clear();
 }
 
 static void ensure_llama_log_callback() {
@@ -310,6 +332,69 @@ static void truncate_to_ctx(std::vector<llama_token> &tokens, int n_ctx, int res
     out.reserve(keep);
     out.insert(out.end(), tokens.end() - keep, tokens.end());
     tokens.swap(out);
+}
+
+// Reuse already-decoded prefix across requests when prompts share a common token prefix.
+// This reduces prefill cost dramatically for multi-turn chat where history is repeated each turn.
+static bool prefill_prompt_with_cache(const std::vector<llama_token> &prompt_tokens, int &out_cur_pos) {
+    if (!gen_ctx || prompt_tokens.empty()) return false;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    llama_memory_t mem = llama_get_memory(gen_ctx);
+
+    size_t lcp = 0;
+    const size_t n_prev = g_cached_prompt_tokens.size();
+    const size_t n_now = prompt_tokens.size();
+    while (lcp < n_prev && lcp < n_now && g_cached_prompt_tokens[lcp] == prompt_tokens[lcp]) {
+        ++lcp;
+    }
+
+    if (n_prev > 0) {
+        if (lcp == 0) {
+            llama_memory_clear(mem, false);
+        } else if (lcp < n_prev) {
+            const bool rm_ok = llama_memory_seq_rm(mem, /*seq_id*/ 0, (llama_pos) lcp, -1);
+            if (!rm_ok) {
+                LOGW("prefill-cache: seq_rm failed (lcp=%zu prev=%zu), falling back to full clear", lcp, n_prev);
+                llama_memory_clear(mem, false);
+                lcp = 0;
+            }
+        }
+    }
+
+    const int n_batch_limit = std::max(1, DEFAULT_N_BATCH);
+    for (size_t i = lcp; i < n_now; i += (size_t) n_batch_limit) {
+        const int cur = (int) std::min((size_t) n_batch_limit, n_now - i);
+        llama_batch batch = llama_batch_init(cur, 0, 1);
+        batch.n_tokens = cur;
+
+        for (int j = 0; j < cur; ++j) {
+            const size_t idx = i + (size_t) j;
+            batch.token[j] = prompt_tokens[idx];
+            batch.pos[j] = (llama_pos) idx;
+            batch.n_seq_id[j] = 1;
+            batch.seq_id[j][0] = 0;
+            batch.logits[j] = (idx + 1 == n_now);
+        }
+
+        const int decode_rc = llama_decode(gen_ctx, batch);
+        llama_batch_free(batch);
+        if (decode_rc != 0) {
+            LOGE("prefill-cache: llama_decode failed rc=%d at token_idx=%zu", decode_rc, i);
+            llama_memory_clear(mem, false);
+            reset_generation_prompt_cache();
+            return false;
+        }
+    }
+
+    g_cached_prompt_tokens = prompt_tokens;
+    out_cur_pos = (int) n_now;
+
+    const auto t1 = std::chrono::steady_clock::now();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    LOGI("prefill-cache: prompt=%zu prev=%zu reused=%zu decoded=%zu cost=%lld ms",
+         n_now, n_prev, lcp, n_now - lcp, (long long) ms);
+    return true;
 }
 
 // ---------- Sanitizer (strong, used by non-streaming only) ----------
@@ -639,6 +724,8 @@ Java_com_llamatik_library_platform_LlamaBridge_shutdown(JNIEnv *, jobject) {
     if (gen_model) llama_model_free(gen_model);
     gen_ctx = nullptr;
     gen_model = nullptr;
+    free_step_batch_if_needed();
+    reset_generation_prompt_cache();
 
     if (g_backend_inited) {
         llama_backend_free();
@@ -666,6 +753,18 @@ Java_com_llamatik_library_platform_LlamaBridge_initGenerateModel(JNIEnv *env, jo
         log_registered_backends("initGenerateModel");
     }
 
+    // Re-init safety: free existing generation resources before loading a new model.
+    if (gen_ctx) {
+        llama_free(gen_ctx);
+        gen_ctx = nullptr;
+    }
+    if (gen_model) {
+        llama_model_free(gen_model);
+        gen_model = nullptr;
+    }
+    free_step_batch_if_needed();
+    reset_generation_prompt_cache();
+
     gen_model = load_model_with_fallback("initGenerateModel", path);
     env->ReleaseStringUTFChars(modelPath, path);
 
@@ -692,13 +791,12 @@ Java_com_llamatik_library_platform_LlamaBridge_initGenerateModel(JNIEnv *env, jo
     }
 
     LOGI("Gen context ready. n_ctx=%u", (unsigned)llama_n_ctx(gen_ctx));
+    ensure_step_batch_ready();
     return JNI_TRUE;
 }
 
 static std::string generate_with_optional_grammar(const char *prompt, const char *grammar, bool sanitize) {
     if (!gen_ctx || !gen_model || !prompt) return "";
-
-    llama_memory_clear(llama_get_memory(gen_ctx), false);
 
     const llama_vocab *vocab = llama_model_get_vocab(gen_model);
     std::vector<llama_token> tokens(2048);
@@ -708,21 +806,8 @@ static std::string generate_with_optional_grammar(const char *prompt, const char
 
     const int n_ctx = (int) llama_n_ctx(gen_ctx);
     if ((int) tokens.size() > n_ctx - 8) truncate_to_ctx(tokens, n_ctx, 8);
-
-    llama_batch batch = llama_batch_init((int) tokens.size(), 0, 1);
-    batch.n_tokens = (int) tokens.size();
-    for (int i = 0; i < batch.n_tokens; ++i) {
-        batch.token[i] = tokens[i];
-        batch.pos[i] = i;
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i] = (i == batch.n_tokens - 1);
-    }
-
-    if (llama_decode(gen_ctx, batch) != 0) {
-        llama_batch_free(batch);
-        return "";
-    }
+    int cur_pos = 0;
+    if (!prefill_prompt_with_cache(tokens, cur_pos)) return "";
 
     float temperature = g_temperature.load();
     float top_p = g_top_p.load();
@@ -741,7 +826,6 @@ static std::string generate_with_optional_grammar(const char *prompt, const char
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
     llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
-    int cur_pos = batch.n_tokens;
     std::string output;
     char buf[8192];
     char sp[64];
@@ -771,23 +855,21 @@ static std::string generate_with_optional_grammar(const char *prompt, const char
 
         if (cur_pos >= n_ctx) break;
 
-        llama_batch step = llama_batch_init(1, 0, 1);
-        step.n_tokens = 1;
-        step.token[0] = tok;
-        step.pos[0] = cur_pos++;
-        step.n_seq_id[0] = 1;
-        step.seq_id[0][0] = 0;
-        step.logits[0] = true;
+        ensure_step_batch_ready();
+        g_step_batch.n_tokens = 1;
+        g_step_batch.token[0] = tok;
+        g_step_batch.pos[0] = cur_pos++;
+        g_step_batch.n_seq_id[0] = 1;
+        g_step_batch.seq_id[0][0] = 0;
+        g_step_batch.logits[0] = true;
 
-        if (llama_decode(gen_ctx, step) != 0) {
-            llama_batch_free(step);
+        if (llama_decode(gen_ctx, g_step_batch) != 0) {
             break;
         }
-        llama_batch_free(step);
+        g_cached_prompt_tokens.push_back(tok);
     }
 
     llama_sampler_free(sampler);
-    llama_batch_free(batch);
 
     if (sanitize) {
         return sanitize_generation(output);
@@ -809,8 +891,6 @@ Java_com_llamatik_library_platform_LlamaBridge_generate(JNIEnv *env, jobject, js
         return nullptr;
     }
 
-    llama_memory_clear(llama_get_memory(gen_ctx), false);
-
     std::vector<llama_token> tokens(2048);
     int n_tokens = tokenize_with_retry(llama_model_get_vocab(gen_model),
             prompt, tokens,
@@ -826,18 +906,8 @@ Java_com_llamatik_library_platform_LlamaBridge_generate(JNIEnv *env, jobject, js
 
     const int n_ctx = (int)llama_n_ctx(gen_ctx);
     if ((int)tokens.size() > n_ctx - 8) truncate_to_ctx(tokens, n_ctx, 8);
-
-    llama_batch batch = llama_batch_init((int) tokens.size(), 0, 1);
-    batch.n_tokens = (int) tokens.size();
-    for (int i = 0; i < batch.n_tokens; ++i) {
-        batch.token[i] = tokens[i];
-        batch.pos[i] = i;
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i] = (i == batch.n_tokens - 1);
-    }
-    if (llama_decode(gen_ctx, batch) != 0) {
-        llama_batch_free(batch);
+    int cur_pos = 0;
+    if (!prefill_prompt_with_cache(tokens, cur_pos)) {
         LOGE("decode failed on prompt");
         return nullptr;
     }
@@ -855,8 +925,6 @@ Java_com_llamatik_library_platform_LlamaBridge_generate(JNIEnv *env, jobject, js
     llama_sampler_chain_add(sampler, llama_sampler_init_top_p(top_p, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
     llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
-
-    int cur_pos = batch.n_tokens;
 
     std::string output;
     char buf[8192];
@@ -881,23 +949,21 @@ Java_com_llamatik_library_platform_LlamaBridge_generate(JNIEnv *env, jobject, js
 
         if (cur_pos >= n_ctx) break;
 
-        llama_batch step = llama_batch_init(1, 0, 1);
-        step.n_tokens = 1;
-        step.token[0] = tok;
-        step.pos[0] = cur_pos++;
-        step.n_seq_id[0] = 1;
-        step.seq_id[0][0] = 0;
-        step.logits[0] = true;
+        ensure_step_batch_ready();
+        g_step_batch.n_tokens = 1;
+        g_step_batch.token[0] = tok;
+        g_step_batch.pos[0] = cur_pos++;
+        g_step_batch.n_seq_id[0] = 1;
+        g_step_batch.seq_id[0][0] = 0;
+        g_step_batch.logits[0] = true;
 
-        if (llama_decode(gen_ctx, step) != 0) {
-            llama_batch_free(step);
+        if (llama_decode(gen_ctx, g_step_batch) != 0) {
             break;
         }
-        llama_batch_free(step);
+        g_cached_prompt_tokens.push_back(tok);
     }
 
     llama_sampler_free(sampler);
-    llama_batch_free(batch);
 
     std::string clean = sanitize_generation(output);
     return env->NewStringUTF(clean.c_str());
@@ -1038,7 +1104,6 @@ static void stream_from_prompt(
 
     // Reset cancel flag at the start of each stream
     g_cancel_requested.store(false, std::memory_order_relaxed);
-    llama_memory_clear(llama_get_memory(gen_ctx), false);
 
     std::vector<llama_token> tokens(2048);
     int n_tokens = tokenize_with_retry(llama_model_get_vocab(gen_model),
@@ -1053,18 +1118,8 @@ static void stream_from_prompt(
 
     const int n_ctx = (int)llama_n_ctx(gen_ctx);
     if ((int)tokens.size() > n_ctx - 8) truncate_to_ctx(tokens, n_ctx, 8);
-
-    llama_batch batch = llama_batch_init((int) tokens.size(), 0, 1);
-    batch.n_tokens = (int) tokens.size();
-    for (int i = 0; i < batch.n_tokens; ++i) {
-        batch.token[i] = tokens[i];
-        batch.pos[i] = i;
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i] = (i == batch.n_tokens - 1);
-    }
-    if (llama_decode(gen_ctx, batch) != 0) {
-        llama_batch_free(batch);
+    int cur_pos = 0;
+    if (!prefill_prompt_with_cache(tokens, cur_pos)) {
         env->CallVoidMethod(jCallback, m.onError, env->NewStringUTF("llama_decode failed on prompt"));
         return;
     }
@@ -1089,8 +1144,6 @@ static void stream_from_prompt(
     llama_sampler_chain_add(sampler, llama_sampler_init_top_p(top_p, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
     llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
-
-    int cur_pos = batch.n_tokens;
 
     char piece_buf[768];
     char spec_buf[64];
@@ -1130,26 +1183,23 @@ static void stream_from_prompt(
 
         if (cur_pos >= n_ctx) break;
 
-        llama_batch step = llama_batch_init(1, 0, 1);
-        step.n_tokens = 1;
-        step.token[0] = tok;
-        step.pos[0] = cur_pos++;
-        step.n_seq_id[0] = 1;
-        step.seq_id[0][0] = 0;
-        step.logits[0] = true;
+        ensure_step_batch_ready();
+        g_step_batch.n_tokens = 1;
+        g_step_batch.token[0] = tok;
+        g_step_batch.pos[0] = cur_pos++;
+        g_step_batch.n_seq_id[0] = 1;
+        g_step_batch.seq_id[0][0] = 0;
+        g_step_batch.logits[0] = true;
 
-        if (llama_decode(gen_ctx, step) != 0) {
-            llama_batch_free(step);
+        if (llama_decode(gen_ctx, g_step_batch) != 0) {
             env->CallVoidMethod(jCallback, m.onError, env->NewStringUTF("llama_decode failed mid-stream"));
             llama_sampler_free(sampler);
-            llama_batch_free(batch);
             return;
         }
-        llama_batch_free(step);
+        g_cached_prompt_tokens.push_back(tok);
     }
 
     llama_sampler_free(sampler);
-    llama_batch_free(batch);
 
     // Always signal completion – Kotlin side will ignore if it has nulled activeRequestId
     env->CallVoidMethod(jCallback, m.onComplete);
