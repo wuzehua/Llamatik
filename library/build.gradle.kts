@@ -446,7 +446,20 @@ extensions.configure<LibraryExtension> {
     defaultConfig {
         minSdk = libs.versions.android.minSdk.get().toInt()
         ndk {
-            abiFilters += setOf("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
+            abiFilters += setOf("arm64-v8a")
+        }
+        externalNativeBuild {
+            cmake {
+                arguments += listOf(
+                    "-DBUILD_SHARED_LIBS=ON",
+                    "-DLLAMA_BUILD_COMMON=ON",
+                    "-DLLAMA_OPENSSL=OFF",
+                    "-DGGML_NATIVE=OFF",
+                    "-DGGML_BACKEND_DL=ON",
+                    "-DGGML_CPU_ALL_VARIANTS=ON",
+                    "-DGGML_LLAMAFILE=OFF"
+                )
+            }
         }
         consumerProguardFiles("consumer-rules.pro")
     }
@@ -470,6 +483,7 @@ extensions.configure<LibraryExtension> {
     externalNativeBuild {
         cmake {
             path = file("src/commonMain/cpp/CMakeLists.txt")
+            version = "3.31.6"
         }
     }
 

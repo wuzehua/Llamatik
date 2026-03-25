@@ -16,6 +16,10 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdarg>   // va_list, va_start, va_end
+#include <filesystem>
+#include <system_error>
+#include <cerrno>
+#include <unistd.h>
 
 // ===================================================================================
 //                              PLATFORM LOGGING
@@ -26,6 +30,8 @@
 
 #if defined(__ANDROID__)
 #include <android/log.h>
+#include <dlfcn.h>
+#include <mutex>
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "LlamaBridge", __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "LlamaBridge", __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  "LlamaBridge", __VA_ARGS__)
@@ -71,9 +77,192 @@ static std::atomic<int> g_top_k = 20;
 static std::atomic<float> g_repeat_penalty = 1.10f;
 static std::atomic<int> g_max_new_tokens = 640;
 
+constexpr int N_THREADS_MIN = 2;
+constexpr int N_THREADS_MAX = 4;
+constexpr int N_THREADS_HEADROOM = 2;
+constexpr int DEFAULT_N_BATCH = 512;
+
 // ===================================================================================
 //                              SMALL HELPERS
 // ===================================================================================
+
+static int compute_android_inference_threads() {
+    const long cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
+    const int guessed = static_cast<int>(cpu_count > 0 ? cpu_count : N_THREADS_MAX) - N_THREADS_HEADROOM;
+    const int n_threads = std::max(N_THREADS_MIN, std::min(N_THREADS_MAX, guessed));
+    return n_threads;
+}
+
+static void ensure_llama_log_callback() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        llama_log_set([](ggml_log_level level, const char *text, void *) {
+            if (text == nullptr) return;
+            switch (level) {
+                case GGML_LOG_LEVEL_ERROR:
+                    LOGE("%s", text);
+                    break;
+                case GGML_LOG_LEVEL_WARN:
+                    LOGW("%s", text);
+                    break;
+                case GGML_LOG_LEVEL_INFO:
+                    LOGI("%s", text);
+                    break;
+                default:
+                    LOGD("%s", text);
+                    break;
+            }
+        }, nullptr);
+        LOGI("llama log callback configured");
+    });
+}
+
+static void log_file_diagnostics(const char *tag, const char *path) {
+    if (path == nullptr || path[0] == '\0') {
+        LOGE("%s: empty model path", tag);
+        return;
+    }
+
+    const int access_result = access(path, R_OK);
+    LOGI("%s: model_path=%s readable=%s errno=%d", tag, path, access_result == 0 ? "yes" : "no", errno);
+
+    std::error_code ec;
+    const std::filesystem::path fs_path(path);
+    const bool exists = std::filesystem::exists(fs_path, ec);
+    if (ec) {
+        LOGW("%s: exists() failed: %s", tag, ec.message().c_str());
+        ec.clear();
+    }
+    LOGI("%s: exists=%s", tag, exists ? "yes" : "no");
+    if (!exists) return;
+
+    const bool is_file = std::filesystem::is_regular_file(fs_path, ec);
+    if (ec) {
+        LOGW("%s: is_regular_file() failed: %s", tag, ec.message().c_str());
+        ec.clear();
+    }
+    LOGI("%s: regular_file=%s", tag, is_file ? "yes" : "no");
+
+    const auto file_size = std::filesystem::file_size(fs_path, ec);
+    if (ec) {
+        LOGW("%s: file_size() failed: %s", tag, ec.message().c_str());
+        ec.clear();
+    } else {
+        LOGI("%s: file_size=%llu bytes", tag, static_cast<unsigned long long>(file_size));
+    }
+}
+
+static void log_registered_backends(const char *tag) {
+    const size_t n_backends = ggml_backend_reg_count();
+    LOGI("%s: ggml registered backends=%zu", tag, n_backends);
+    for (size_t i = 0; i < n_backends; ++i) {
+        auto *reg = ggml_backend_reg_get(i);
+        const char *name = reg ? ggml_backend_reg_name(reg) : "(null)";
+        LOGI("%s: backend[%zu]=%s", tag, i, name ? name : "(null)");
+    }
+}
+
+static llama_model *load_model_with_fallback(const char *tag, const char *path) {
+    llama_model_params params = llama_model_default_params();
+    LOGI("%s: trying default load params (mmap=%d mlock=%d check_tensors=%d)",
+         tag, params.use_mmap, params.use_mlock, params.check_tensors);
+    llama_model *model = llama_model_load_from_file(path, params);
+    if (model != nullptr) {
+        LOGI("%s: model loaded with default params", tag);
+        return model;
+    }
+
+    LOGW("%s: default load failed, retrying with mmap disabled", tag);
+    params.use_mmap = false;
+    params.use_mlock = false;
+    model = llama_model_load_from_file(path, params);
+    if (model != nullptr) {
+        LOGI("%s: model loaded after fallback (mmap=0, mlock=0)", tag);
+    } else {
+        LOGE("%s: model load failed after fallback", tag);
+    }
+    return model;
+}
+
+static void ensure_android_backends_loaded() {
+#if defined(__ANDROID__)
+    static std::mutex load_mu;
+    std::lock_guard<std::mutex> lock(load_mu);
+
+    if (ggml_backend_reg_count() > 0) {
+        return;
+    }
+
+    auto try_log_backends = [](const char *stage) -> bool {
+        const size_t count = ggml_backend_reg_count();
+        LOGI("backend-load stage=%s count=%zu", stage, count);
+        for (size_t i = 0; i < count; ++i) {
+            auto *reg = ggml_backend_reg_get(i);
+            const char *name = reg ? ggml_backend_reg_name(reg) : "(null)";
+            LOGI("backend-load stage=%s backend[%zu]=%s", stage, i, name ? name : "(null)");
+        }
+        return count > 0;
+    };
+
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<void *>(&ensure_android_backends_loaded), &info) != 0 && info.dli_fname != nullptr) {
+        const std::string so_path(info.dli_fname);
+        LOGI("backend-load: dladdr so path=%s", so_path.c_str());
+
+        const size_t slash = so_path.find_last_of('/');
+        if (slash != std::string::npos && slash > 0) {
+            const std::string native_lib_dir = so_path.substr(0, slash);
+
+            // On some Android configurations dladdr can return APK-internal paths like "...base.apk!/lib/arm64-v8a".
+            const bool looks_like_apk_internal = native_lib_dir.find('!') != std::string::npos;
+            if (!looks_like_apk_internal) {
+                LOGI("backend-load: trying ggml_backend_load_all_from_path(%s)", native_lib_dir.c_str());
+                ggml_backend_load_all_from_path(native_lib_dir.c_str());
+                if (try_log_backends("from_path")) {
+                    return;
+                }
+            } else {
+                LOGW("backend-load: skip from_path, APK-internal path is not directly scannable: %s", native_lib_dir.c_str());
+            }
+        } else {
+            LOGW("backend-load: failed to parse native lib dir from %s", so_path.c_str());
+        }
+    } else {
+        LOGW("backend-load: dladdr failed, cannot resolve native lib path");
+    }
+
+    LOGW("backend-load: trying ggml_backend_load_all()");
+    ggml_backend_load_all();
+    if (try_log_backends("load_all")) {
+        return;
+    }
+
+    // Final fallback: try explicit sonames for Android CPU backend variants.
+    // This helps when path-based scans fail but linker namespace can still resolve by soname.
+    // Prefer higher-capability Android CPU variants first for better performance.
+    const char *cpu_sonames[] = {
+        "libggml-cpu-android_armv9.2_2.so",
+        "libggml-cpu-android_armv9.2_1.so",
+        "libggml-cpu-android_armv9.0_1.so",
+        "libggml-cpu-android_armv8.6_1.so",
+        "libggml-cpu-android_armv8.2_2.so",
+        "libggml-cpu-android_armv8.2_1.so",
+        "libggml-cpu-android_armv8.0_1.so",
+        "libggml-cpu.so",
+    };
+    for (const char *soname : cpu_sonames) {
+        ggml_backend_reg_t reg = ggml_backend_load(soname);
+        LOGI("backend-load: ggml_backend_load(%s) -> %s", soname, reg ? "ok" : "null");
+        if (ggml_backend_reg_count() > 0) {
+            break;
+        }
+    }
+
+    if (!try_log_backends("explicit_soname")) {
+        LOGE("backend-load: no ggml backends were loaded after all fallback attempts");
+    }
+#endif
+}
 
 static inline std::string trim(const std::string &s) {
     size_t b = s.find_first_not_of(" \t\r\n");
@@ -336,24 +525,34 @@ JNIEXPORT jboolean JNICALL
 Java_com_llamatik_library_platform_LlamaBridge_initModel(JNIEnv *env, jobject, jstring modelPath) {
     const char *path = env->GetStringUTFChars(modelPath, nullptr);
     LOGI("initModel (embed): %s", path ? path : "(null)");
+    ensure_llama_log_callback();
+    log_file_diagnostics("initModel(embed)", path);
+
+    ensure_android_backends_loaded();
 
     if (!g_backend_inited) {
         llama_backend_init();
         g_backend_inited = true;
+        log_registered_backends("initModel(embed)");
     }
 
-    llama_model_params mparams = llama_model_default_params();
-    emb_model = llama_model_load_from_file(path, mparams);
+    emb_model = load_model_with_fallback("initModel(embed)", path);
     env->ReleaseStringUTFChars(modelPath, path);
 
     if (!emb_model) {
-        LOGE("embed model load failed");
+        LOGE("embed model load failed (see llama/ggml logs above for root cause)");
         return JNI_FALSE;
     }
 
     llama_context_params cparams = llama_context_default_params();
     cparams.embeddings = true;
     cparams.n_ctx = 2048;
+    cparams.n_batch = DEFAULT_N_BATCH;
+    cparams.n_ubatch = DEFAULT_N_BATCH;
+    cparams.n_threads = compute_android_inference_threads();
+    cparams.n_threads_batch = cparams.n_threads;
+    LOGI("initModel(embed): n_ctx=%u n_batch=%u n_ubatch=%u n_threads=%d",
+         cparams.n_ctx, cparams.n_batch, cparams.n_ubatch, cparams.n_threads);
 
     emb_ctx = llama_init_from_model(emb_model, cparams);
     if (!emb_ctx) {
@@ -456,24 +655,34 @@ JNIEXPORT jboolean JNICALL
 Java_com_llamatik_library_platform_LlamaBridge_initGenerateModel(JNIEnv *env, jobject, jstring modelPath) {
     const char *path = env->GetStringUTFChars(modelPath, nullptr);
     LOGI("initGenerateModel: %s", path ? path : "(null)");
+    ensure_llama_log_callback();
+    log_file_diagnostics("initGenerateModel", path);
+
+    ensure_android_backends_loaded();
 
     if (!g_backend_inited) {
         llama_backend_init();
         g_backend_inited = true;
+        log_registered_backends("initGenerateModel");
     }
 
-    llama_model_params mparams = llama_model_default_params();
-    gen_model = llama_model_load_from_file(path, mparams);
+    gen_model = load_model_with_fallback("initGenerateModel", path);
     env->ReleaseStringUTFChars(modelPath, path);
 
     if (!gen_model) {
-        LOGE("gen model load failed");
+        LOGE("gen model load failed (see llama/ggml logs above for root cause)");
         return JNI_FALSE;
     }
 
     llama_context_params cparams = llama_context_default_params();
     cparams.embeddings = false;
     cparams.n_ctx = 4096;
+    cparams.n_batch = DEFAULT_N_BATCH;
+    cparams.n_ubatch = DEFAULT_N_BATCH;
+    cparams.n_threads = compute_android_inference_threads();
+    cparams.n_threads_batch = cparams.n_threads;
+    LOGI("initGenerateModel: n_ctx=%u n_batch=%u n_ubatch=%u n_threads=%d",
+         cparams.n_ctx, cparams.n_batch, cparams.n_ubatch, cparams.n_threads);
 
     gen_ctx = llama_init_from_model(gen_model, cparams);
     if (!gen_ctx) {
