@@ -4,6 +4,9 @@
 
 #include "json-schema-to-grammar.h"
 #include "nlohmann/json.hpp"
+#include "common.h"
+#include "chat.h"
+#include "sampling.h"
 
 #include <string>
 #include <sstream>
@@ -20,6 +23,7 @@
 #include <system_error>
 #include <cerrno>
 #include <chrono>
+#include <functional>
 #include <unistd.h>
 
 // ===================================================================================
@@ -67,7 +71,22 @@ static struct llama_model *gen_model = nullptr;
 static struct llama_context *gen_ctx = nullptr;
 static llama_batch g_step_batch = {};
 static bool g_step_batch_inited = false;
+static llama_batch g_gen_batch = {};
+static bool g_gen_batch_inited = false;
+static common_chat_templates_ptr g_gen_chat_templates;
+static std::vector<common_chat_msg> g_gen_chat_msgs;
+static llama_pos g_gen_system_prompt_position = 0;
+static llama_pos g_gen_current_position = 0;
+static llama_pos g_gen_stop_generation_position = 0;
+static std::string g_gen_cached_token_chars;
+static std::ostringstream g_gen_assistant_ss;
+static size_t g_gen_context_signature = 0;
+static bool g_gen_system_ready = false;
 static std::vector<llama_token> g_cached_prompt_tokens;
+static std::vector<llama_token> g_cached_prefix_tokens;
+static size_t g_cached_session_signature = 0;
+static int g_session_cur_pos = 0;
+static bool g_session_valid = false;
 
 // Backend lifetime
 static bool g_backend_inited = false;
@@ -75,16 +94,18 @@ static bool g_backend_inited = false;
 // Streaming cancel flag (for generateStream)
 static std::atomic<bool> g_cancel_requested{false};
 
-static std::atomic<float> g_temperature = 0.55f;
-static std::atomic<float> g_top_p = 0.80f;
-static std::atomic<int> g_top_k = 20;
-static std::atomic<float> g_repeat_penalty = 1.10f;
-static std::atomic<int> g_max_new_tokens = 640;
+// Defaults tuned closer to llama.android demo behavior (more stable and faster-to-stop in practice).
+static std::atomic<float> g_temperature = 0.30f;
+static std::atomic<float> g_top_p = 0.95f;
+static std::atomic<int> g_top_k = 40;
+static std::atomic<float> g_repeat_penalty = 1.00f;
+static std::atomic<int> g_max_new_tokens = 256;
 
 constexpr int N_THREADS_MIN = 2;
 constexpr int N_THREADS_MAX = 4;
 constexpr int N_THREADS_HEADROOM = 2;
 constexpr int DEFAULT_N_BATCH = 512;
+constexpr size_t LOG_PREVIEW_MAX = 240;
 
 // ===================================================================================
 //                              SMALL HELPERS
@@ -111,8 +132,35 @@ static void free_step_batch_if_needed() {
     }
 }
 
+static void ensure_gen_batch_ready() {
+    if (!g_gen_batch_inited) {
+        g_gen_batch = llama_batch_init(DEFAULT_N_BATCH, 0, 1);
+        g_gen_batch_inited = true;
+    }
+}
+
+static void free_gen_batch_if_needed() {
+    if (g_gen_batch_inited) {
+        llama_batch_free(g_gen_batch);
+        g_gen_batch_inited = false;
+    }
+}
+
 static void reset_generation_prompt_cache() {
     g_cached_prompt_tokens.clear();
+    g_cached_prefix_tokens.clear();
+    g_cached_session_signature = 0;
+    g_session_cur_pos = 0;
+    g_session_valid = false;
+    g_gen_chat_msgs.clear();
+    g_gen_system_prompt_position = 0;
+    g_gen_current_position = 0;
+    g_gen_stop_generation_position = 0;
+    g_gen_cached_token_chars.clear();
+    g_gen_assistant_ss.str("");
+    g_gen_assistant_ss.clear();
+    g_gen_context_signature = 0;
+    g_gen_system_ready = false;
 }
 
 static void ensure_llama_log_callback() {
@@ -293,6 +341,19 @@ static inline std::string trim(const std::string &s) {
     return s.substr(b, e - b + 1);
 }
 
+static std::string preview_for_log(const std::string &s, size_t max_len = LOG_PREVIEW_MAX) {
+    if (s.empty()) return "";
+    std::string out;
+    out.reserve(std::min(s.size(), max_len) + 16);
+    for (char c : s) {
+        if (c == '\n' || c == '\r' || c == '\t') out.push_back(' ');
+        else out.push_back(c);
+        if (out.size() >= max_len) break;
+    }
+    if (s.size() > max_len) out += "...";
+    return out;
+}
+
 static inline std::string to_lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
         return (char) std::tolower(c);
@@ -334,9 +395,20 @@ static void truncate_to_ctx(std::vector<llama_token> &tokens, int n_ctx, int res
     tokens.swap(out);
 }
 
+struct PrefillStats {
+    size_t prompt_tokens = 0;
+    size_t prev_tokens = 0;
+    size_t reused_tokens = 0;
+    size_t decoded_tokens = 0;
+    long long elapsed_ms = 0;
+};
+
 // Reuse already-decoded prefix across requests when prompts share a common token prefix.
 // This reduces prefill cost dramatically for multi-turn chat where history is repeated each turn.
-static bool prefill_prompt_with_cache(const std::vector<llama_token> &prompt_tokens, int &out_cur_pos) {
+static bool prefill_prompt_with_cache(
+        const std::vector<llama_token> &prompt_tokens,
+        int &out_cur_pos,
+        PrefillStats *stats = nullptr) {
     if (!gen_ctx || prompt_tokens.empty()) return false;
 
     const auto t0 = std::chrono::steady_clock::now();
@@ -347,6 +419,11 @@ static bool prefill_prompt_with_cache(const std::vector<llama_token> &prompt_tok
     const size_t n_now = prompt_tokens.size();
     while (lcp < n_prev && lcp < n_now && g_cached_prompt_tokens[lcp] == prompt_tokens[lcp]) {
         ++lcp;
+    }
+
+    // Full-prefix reuse needs one token re-decode to refresh "last logits" for sampling.
+    if (lcp == n_now && n_now > 0) {
+        lcp = n_now - 1;
     }
 
     if (n_prev > 0) {
@@ -392,6 +469,13 @@ static bool prefill_prompt_with_cache(const std::vector<llama_token> &prompt_tok
 
     const auto t1 = std::chrono::steady_clock::now();
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    if (stats) {
+        stats->prompt_tokens = n_now;
+        stats->prev_tokens = n_prev;
+        stats->reused_tokens = lcp;
+        stats->decoded_tokens = n_now - lcp;
+        stats->elapsed_ms = ms;
+    }
     LOGI("prefill-cache: prompt=%zu prev=%zu reused=%zu decoded=%zu cost=%lld ms",
          n_now, n_prev, lcp, n_now - lcp, (long long) ms);
     return true;
@@ -601,6 +685,54 @@ static std::string build_chat_prompt_gemma(const std::string &system_msg,
     return oss.str();
 }
 
+static size_t make_session_signature(const std::string &system_msg, const std::string &context_block) {
+    std::hash<std::string> h;
+    std::string key;
+    key.reserve(system_msg.size() + context_block.size() + 1);
+    key.append(system_msg);
+    key.push_back('\x1f');
+    key.append(context_block);
+    return h(key);
+}
+
+static std::string build_chat_prefix_gemma(const std::string &system_msg, const std::string &context_block) {
+    std::ostringstream oss;
+    oss << "<start_of_turn>system\n"
+        << system_msg
+        << "\n<end_of_turn>\n"
+        << "<start_of_turn>user\n"
+        << "CONTEXT:\n"
+        << context_block
+        << "\n\nQUESTION:\n";
+    return oss.str();
+}
+
+static std::string build_chat_user_suffix_gemma(const std::string &user_msg) {
+    std::ostringstream oss;
+    oss << user_msg
+        << "\n<end_of_turn>\n"
+        << "<start_of_turn>model\n"
+        << "ANSWER: ";
+    return oss.str();
+}
+
+static bool tokenize_prompt(
+        const char *tag,
+        const llama_vocab *vocab,
+        const std::string &text,
+        std::vector<llama_token> &out_tokens,
+        bool add_bos,
+        bool parse_special) {
+    out_tokens.assign(2048, 0);
+    int n_tokens = tokenize_with_retry(vocab, text.c_str(), out_tokens, add_bos, parse_special);
+    if (n_tokens <= 0) {
+        LOGE("%s: tokenize failed", tag);
+        return false;
+    }
+    out_tokens.resize(n_tokens);
+    return true;
+}
+
 // ===================================================================================
 //                                   EMBEDDINGS
 // ===================================================================================
@@ -725,6 +857,8 @@ Java_com_llamatik_library_platform_LlamaBridge_shutdown(JNIEnv *, jobject) {
     gen_ctx = nullptr;
     gen_model = nullptr;
     free_step_batch_if_needed();
+    free_gen_batch_if_needed();
+    g_gen_chat_templates.reset();
     reset_generation_prompt_cache();
 
     if (g_backend_inited) {
@@ -763,6 +897,8 @@ Java_com_llamatik_library_platform_LlamaBridge_initGenerateModel(JNIEnv *env, jo
         gen_model = nullptr;
     }
     free_step_batch_if_needed();
+    free_gen_batch_if_needed();
+    g_gen_chat_templates.reset();
     reset_generation_prompt_cache();
 
     gen_model = load_model_with_fallback("initGenerateModel", path);
@@ -792,32 +928,252 @@ Java_com_llamatik_library_platform_LlamaBridge_initGenerateModel(JNIEnv *env, jo
 
     LOGI("Gen context ready. n_ctx=%u", (unsigned)llama_n_ctx(gen_ctx));
     ensure_step_batch_ready();
+    ensure_gen_batch_ready();
+    g_gen_chat_templates = common_chat_templates_init(gen_model, "");
+    if (!g_gen_chat_templates) {
+        LOGW("initGenerateModel: failed to init chat templates, fallback to raw prompts");
+    }
     return JNI_TRUE;
 }
 
-static std::string generate_with_optional_grammar(const char *prompt, const char *grammar, bool sanitize) {
-    if (!gen_ctx || !gen_model || !prompt) return "";
+static const char *default_generation_system_prompt() {
+    return "You are a careful assistant. Answer ONLY from the provided context. "
+           "If the context is insufficient, respond exactly: \"I don't have enough information in my sources.\" "
+           "Write 2–5 short sentences in plain text. Do not use bullets or numbering.";
+}
 
-    const llama_vocab *vocab = llama_model_get_vocab(gen_model);
-    std::vector<llama_token> tokens(2048);
-    int n_tokens = tokenize_with_retry(vocab, prompt, tokens, /*add_bos*/ true, /*parse_special*/ true);
-    if (n_tokens <= 0) return "";
-    tokens.resize(n_tokens);
+constexpr const char *ROLE_SYSTEM = "system";
+constexpr const char *ROLE_USER = "user";
+constexpr const char *ROLE_ASSISTANT = "assistant";
+constexpr int GEN_OVERFLOW_HEADROOM = 4;
 
+static bool is_valid_utf8(const char *string) {
+    if (!string) return true;
+    const auto *bytes = (const unsigned char *) string;
+    int num;
+    while (*bytes != 0x00) {
+        if ((*bytes & 0x80) == 0x00) num = 1;
+        else if ((*bytes & 0xE0) == 0xC0) num = 2;
+        else if ((*bytes & 0xF0) == 0xE0) num = 3;
+        else if ((*bytes & 0xF8) == 0xF0) num = 4;
+        else return false;
+        bytes += 1;
+        for (int i = 1; i < num; ++i) {
+            if ((*bytes & 0xC0) != 0x80) return false;
+            bytes += 1;
+        }
+    }
+    return true;
+}
+
+static void reset_generation_short_term_states() {
+    g_gen_stop_generation_position = 0;
+    g_gen_cached_token_chars.clear();
+    g_gen_assistant_ss.str("");
+    g_gen_assistant_ss.clear();
+}
+
+static void reset_generation_long_term_states(bool clear_kv_cache = true) {
+    g_gen_chat_msgs.clear();
+    g_gen_system_prompt_position = 0;
+    g_gen_current_position = 0;
+    g_gen_context_signature = 0;
+    g_gen_system_ready = false;
+    reset_generation_short_term_states();
+    if (clear_kv_cache && gen_ctx) {
+        llama_memory_clear(llama_get_memory(gen_ctx), false);
+    }
+}
+
+static bool shift_generation_context() {
+    if (!gen_ctx) return false;
+    if (g_gen_current_position <= g_gen_system_prompt_position + 1) return false;
+    const int n_discard = (g_gen_current_position - g_gen_system_prompt_position) / 2;
+    if (n_discard <= 0) return false;
+    LOGI("generate: shifting context, discard=%d", n_discard);
+    auto mem = llama_get_memory(gen_ctx);
+    llama_memory_seq_rm(mem, 0, g_gen_system_prompt_position, g_gen_system_prompt_position + n_discard);
+    llama_memory_seq_add(mem, 0, g_gen_system_prompt_position + n_discard, g_gen_current_position, -n_discard);
+    g_gen_current_position -= n_discard;
+    g_gen_stop_generation_position = std::max(g_gen_current_position, g_gen_stop_generation_position - n_discard);
+    return true;
+}
+
+static std::string generation_chat_add_and_format(const std::string &role, const std::string &content) {
+    common_chat_msg new_msg;
+    new_msg.role = role;
+    new_msg.content = content;
+    const bool add_ass = (role == ROLE_USER);
+    auto formatted = common_chat_format_single(
+            g_gen_chat_templates.get(), g_gen_chat_msgs, new_msg, add_ass, /*use_jinja=*/false);
+    g_gen_chat_msgs.push_back(new_msg);
+    return formatted;
+}
+
+static bool decode_tokens_in_batches_generation(
+        const llama_tokens &tokens,
+        llama_pos start_pos,
+        bool compute_last_logit = false) {
+    if (!gen_ctx) return false;
+    ensure_gen_batch_ready();
     const int n_ctx = (int) llama_n_ctx(gen_ctx);
-    if ((int) tokens.size() > n_ctx - 8) truncate_to_ctx(tokens, n_ctx, 8);
+    for (int i = 0; i < (int) tokens.size(); i += DEFAULT_N_BATCH) {
+        const int cur_batch_size = std::min((int) tokens.size() - i, DEFAULT_N_BATCH);
+        common_batch_clear(g_gen_batch);
+        if (start_pos + i + cur_batch_size >= n_ctx - GEN_OVERFLOW_HEADROOM) {
+            if (!shift_generation_context()) {
+                LOGW("generate: context full and shift failed");
+                return false;
+            }
+            start_pos = g_gen_current_position - i;
+        }
+        for (int j = 0; j < cur_batch_size; ++j) {
+            const llama_token tok = tokens[i + j];
+            const llama_pos pos = start_pos + i + j;
+            const bool want_logit = compute_last_logit && (i + j == (int) tokens.size() - 1);
+            common_batch_add(g_gen_batch, tok, pos, {0}, want_logit);
+        }
+        if (llama_decode(gen_ctx, g_gen_batch) != 0) {
+            LOGE("generate: llama_decode failed in batch prefill");
+            return false;
+        }
+    }
+    return true;
+}
+
+static common_sampler *create_generation_sampler() {
+    common_params_sampling sparams;
+    sparams.temp = g_temperature.load();
+    sparams.top_p = g_top_p.load();
+    sparams.top_k = g_top_k.load();
+    sparams.penalty_repeat = g_repeat_penalty.load();
+    sparams.penalty_last_n = 128;
+    LOGI("generate sampler: temp=%.3f top_p=%.3f top_k=%d repeat_penalty=%.3f penalty_last_n=%d",
+         sparams.temp, sparams.top_p, sparams.top_k, sparams.penalty_repeat, sparams.penalty_last_n);
+    return common_sampler_init(gen_model, sparams);
+}
+
+static bool process_system_prompt_internal(const std::string &system_prompt, int &prompt_tokens) {
+    if (!gen_ctx || !gen_model) return false;
+    reset_generation_long_term_states(true);
+    std::string formatted = system_prompt;
+    const bool has_chat_template = g_gen_chat_templates && common_chat_templates_was_explicit(g_gen_chat_templates.get());
+    if (has_chat_template) {
+        formatted = generation_chat_add_and_format(ROLE_SYSTEM, system_prompt);
+    }
+    LOGI("system prompt: has_template=%s raw_len=%zu formatted_len=%zu raw_preview=\"%s\" formatted_preview=\"%s\"",
+         has_chat_template ? "yes" : "no",
+         system_prompt.size(),
+         formatted.size(),
+         preview_for_log(system_prompt).c_str(),
+         preview_for_log(formatted).c_str());
+    const auto system_tokens = common_tokenize(gen_ctx, formatted, has_chat_template, has_chat_template);
+    prompt_tokens = (int) system_tokens.size();
+    LOGI("system prompt tokenize: tokens=%d", prompt_tokens);
+    if (prompt_tokens <= 0) return false;
+    if (!decode_tokens_in_batches_generation(system_tokens, g_gen_current_position, false)) return false;
+    g_gen_system_prompt_position = g_gen_current_position = prompt_tokens;
+    g_gen_system_ready = true;
+    return true;
+}
+
+static bool process_user_prompt_internal(const std::string &user_prompt, int predict_len, int &prompt_tokens) {
+    if (!gen_ctx || !gen_model) return false;
+    reset_generation_short_term_states();
+    std::string formatted = user_prompt;
+    const bool has_chat_template = g_gen_chat_templates && common_chat_templates_was_explicit(g_gen_chat_templates.get());
+    if (has_chat_template) {
+        formatted = generation_chat_add_and_format(ROLE_USER, user_prompt);
+    }
+    LOGI("user prompt: has_template=%s predict_len=%d raw_len=%zu formatted_len=%zu raw_preview=\"%s\" formatted_preview=\"%s\"",
+         has_chat_template ? "yes" : "no",
+         predict_len,
+         user_prompt.size(),
+         formatted.size(),
+         preview_for_log(user_prompt).c_str(),
+         preview_for_log(formatted).c_str());
+    auto user_tokens = common_tokenize(gen_ctx, formatted, has_chat_template, has_chat_template);
+    prompt_tokens = (int) user_tokens.size();
+    LOGI("user prompt tokenize: tokens=%d current_pos_before=%d", prompt_tokens, (int) g_gen_current_position);
+    if (prompt_tokens <= 0) return false;
+    if (!decode_tokens_in_batches_generation(user_tokens, g_gen_current_position, true)) return false;
+    g_gen_current_position += prompt_tokens;
+    g_gen_stop_generation_position = g_gen_current_position + predict_len;
+    return true;
+}
+
+static bool generate_next_token_internal(common_sampler *sampler, std::string &out, std::string &stop_reason) {
+    if (!gen_ctx || !gen_model || !sampler) {
+        stop_reason = "invalid_state";
+        return false;
+    }
+    const int n_ctx = (int) llama_n_ctx(gen_ctx);
+    if (g_gen_current_position >= n_ctx - GEN_OVERFLOW_HEADROOM) {
+        if (!shift_generation_context()) {
+            stop_reason = "ctx_limit";
+            return false;
+        }
+    }
+    if (g_gen_current_position >= g_gen_stop_generation_position) {
+        stop_reason = "predict_cap";
+        return false;
+    }
+
+    const llama_token tok = common_sampler_sample(sampler, gen_ctx, -1);
+    common_sampler_accept(sampler, tok, true);
+
+    ensure_gen_batch_ready();
+    common_batch_clear(g_gen_batch);
+    common_batch_add(g_gen_batch, tok, g_gen_current_position, {0}, true);
+    if (llama_decode(gen_ctx, g_gen_batch) != 0) {
+        stop_reason = "decode_error";
+        return false;
+    }
+    g_gen_current_position++;
+
+    const auto *vocab = llama_model_get_vocab(gen_model);
+    if (llama_vocab_is_eog(vocab, tok)) {
+        stop_reason = "eog";
+        if (!g_gen_assistant_ss.str().empty()) {
+            (void) generation_chat_add_and_format(ROLE_ASSISTANT, g_gen_assistant_ss.str());
+        }
+        return false;
+    }
+
+    const auto piece = common_token_to_piece(gen_ctx, tok);
+    g_gen_cached_token_chars += piece;
+    if (is_valid_utf8(g_gen_cached_token_chars.c_str())) {
+        out += g_gen_cached_token_chars;
+        g_gen_assistant_ss << g_gen_cached_token_chars;
+        g_gen_cached_token_chars.clear();
+    }
+    stop_reason = "running";
+    return true;
+}
+
+static std::string run_generation_from_prompt_tokens(
+        const std::vector<llama_token> &prompt_tokens,
+        const char *grammar,
+        bool sanitize,
+        const char *log_tag,
+        PrefillStats *prefill_stats = nullptr,
+        long long *generation_ms = nullptr) {
+    if (!gen_ctx || !gen_model || prompt_tokens.empty()) return "";
+
     int cur_pos = 0;
-    if (!prefill_prompt_with_cache(tokens, cur_pos)) return "";
+    if (!prefill_prompt_with_cache(prompt_tokens, cur_pos, prefill_stats)) return "";
 
     float temperature = g_temperature.load();
     float top_p = g_top_p.load();
     int top_k = g_top_k.load();
     float repeat_penalty = g_repeat_penalty.load();
     int max_new_tokens = g_max_new_tokens.load();
+    const int n_ctx = (int) llama_n_ctx(gen_ctx);
+    const llama_vocab *vocab = llama_model_get_vocab(gen_model);
+    const bool heuristic_stop_enabled = !(grammar && grammar[0]);
 
     llama_sampler *sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
     if (grammar && grammar[0]) {
-        // Hard constraint first
         llama_sampler_chain_add(sampler, llama_sampler_init_grammar(vocab, grammar, "root"));
     }
     llama_sampler_chain_add(sampler, llama_sampler_init_penalties(128, repeat_penalty, 0.0f, 0.10f));
@@ -826,24 +1182,40 @@ static std::string generate_with_optional_grammar(const char *prompt, const char
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
     llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
+    const auto gen_t0 = std::chrono::steady_clock::now();
     std::string output;
     char buf[8192];
     char sp[64];
+    int generated_tokens = 0;
+    const char *stop_reason = "max_new_tokens";
 
     for (int i = 0; i < max_new_tokens; ++i) {
         if (g_cancel_requested.load(std::memory_order_relaxed)) {
+            stop_reason = "cancelled";
             break;
         }
 
         llama_token tok = llama_sampler_sample(sampler, gen_ctx, -1);
-        if (tok < 0) break;
-        if (tok == llama_vocab_eos(vocab)) break;
+        if (tok < 0) {
+            stop_reason = "sample_error";
+            break;
+        }
+        if (llama_vocab_is_eog(vocab, tok)) {
+            stop_reason = "eog";
+            break;
+        }
+        if (tok == llama_vocab_eos(vocab)) {
+            stop_reason = "eos";
+            break;
+        }
 
-        // early stop on chat EOT tokens if they appear
         int sn = llama_token_to_piece(vocab, tok, sp, (int) sizeof(sp), 0, /*special*/ 1);
         if (sn > 0) {
             sp[std::min(sn, (int) sizeof(sp) - 1)] = '\0';
-            if (std::strcmp(sp, "<end_of_turn>") == 0 || std::strcmp(sp, "<|eot_id|>") == 0 || std::strcmp(sp, "<start_of_turn>") == 0) {
+            if (std::strcmp(sp, "<end_of_turn>") == 0 ||
+                std::strcmp(sp, "<|eot_id|>") == 0 ||
+                std::strcmp(sp, "<start_of_turn>") == 0) {
+                stop_reason = "chat_stop_piece";
                 break;
             }
         }
@@ -853,7 +1225,21 @@ static std::string generate_with_optional_grammar(const char *prompt, const char
         int nn = llama_token_to_piece(vocab, tok, buf, (int) sizeof(buf), 0, /*special*/ 0);
         if (nn > 0) output.append(buf, nn);
 
-        if (cur_pos >= n_ctx) break;
+        if (heuristic_stop_enabled && generated_tokens >= 24) {
+            const size_t n = output.size();
+            const bool ends_with_double_newline = n >= 2 && output[n - 1] == '\n' && output[n - 2] == '\n';
+            const bool ends_with_sentence = n >= 1 &&
+                    (output[n - 1] == '.' || output[n - 1] == '!' || output[n - 1] == '?');
+            if (ends_with_double_newline || (ends_with_sentence && generated_tokens >= 48)) {
+                stop_reason = "heuristic_eos";
+                break;
+            }
+        }
+
+        if (cur_pos >= n_ctx) {
+            stop_reason = "ctx_limit";
+            break;
+        }
 
         ensure_step_batch_ready();
         g_step_batch.n_tokens = 1;
@@ -864,17 +1250,66 @@ static std::string generate_with_optional_grammar(const char *prompt, const char
         g_step_batch.logits[0] = true;
 
         if (llama_decode(gen_ctx, g_step_batch) != 0) {
+            LOGE("%s: llama_decode failed during generation loop", log_tag);
+            stop_reason = "decode_error";
             break;
         }
         g_cached_prompt_tokens.push_back(tok);
+        ++generated_tokens;
     }
 
+    const auto gen_t1 = std::chrono::steady_clock::now();
+    const long long gen_cost_ms = std::chrono::duration_cast<std::chrono::milliseconds>(gen_t1 - gen_t0).count();
+    if (generation_ms) *generation_ms = gen_cost_ms;
+    LOGI("%s: generation cost=%lld ms generated_tokens=%d max_new_tokens=%d stop_reason=%s",
+         log_tag, gen_cost_ms, generated_tokens, max_new_tokens, stop_reason);
+
+    g_session_cur_pos = cur_pos;
     llama_sampler_free(sampler);
-
-    if (sanitize) {
-        return sanitize_generation(output);
-    }
+    if (sanitize) return sanitize_generation(output);
     return trim(output);
+}
+
+static bool ensure_session_prefix(
+        const std::string &system,
+        const std::string &context,
+        const llama_vocab *vocab) {
+    const size_t signature = make_session_signature(system, context);
+    if (!g_session_valid || g_cached_session_signature != signature || g_cached_prefix_tokens.empty()) {
+        reset_generation_prompt_cache();
+        std::string prefix = build_chat_prefix_gemma(system, context);
+        if (!tokenize_prompt("generateWithContext(prefix)", vocab, prefix, g_cached_prefix_tokens, true, true)) {
+            return false;
+        }
+        const int n_ctx = (int) llama_n_ctx(gen_ctx);
+        if ((int) g_cached_prefix_tokens.size() > n_ctx - 8) truncate_to_ctx(g_cached_prefix_tokens, n_ctx, 8);
+        PrefillStats prefix_stats{};
+        if (!prefill_prompt_with_cache(g_cached_prefix_tokens, g_session_cur_pos, &prefix_stats)) return false;
+        g_cached_session_signature = signature;
+        g_session_valid = true;
+        LOGI("generateWithContext: session initialized signature=%zu prefix_tokens=%zu",
+             signature, g_cached_prefix_tokens.size());
+        return true;
+    }
+
+    PrefillStats rewind_stats{};
+    if (!prefill_prompt_with_cache(g_cached_prefix_tokens, g_session_cur_pos, &rewind_stats)) return false;
+    LOGI("generateWithContext: session reused signature=%zu prefix_tokens=%zu",
+         signature, g_cached_prefix_tokens.size());
+    return true;
+}
+
+static std::string generate_with_optional_grammar(const char *prompt, const char *grammar, bool sanitize) {
+    if (!gen_ctx || !gen_model || !prompt) return "";
+    const llama_vocab *vocab = llama_model_get_vocab(gen_model);
+    std::vector<llama_token> tokens;
+    if (!tokenize_prompt("generate", vocab, prompt, tokens, /*add_bos*/ true, /*parse_special*/ true)) return "";
+    const int n_ctx = (int) llama_n_ctx(gen_ctx);
+    if ((int) tokens.size() > n_ctx - 8) truncate_to_ctx(tokens, n_ctx, 8);
+
+    PrefillStats stats{};
+    long long gen_ms = 0;
+    return run_generation_from_prompt_tokens(tokens, grammar, sanitize, "generate", &stats, &gen_ms);
 }
 
 extern "C"
@@ -891,88 +1326,63 @@ Java_com_llamatik_library_platform_LlamaBridge_generate(JNIEnv *env, jobject, js
         return nullptr;
     }
 
-    std::vector<llama_token> tokens(2048);
-    int n_tokens = tokenize_with_retry(llama_model_get_vocab(gen_model),
-            prompt, tokens,
-            /*add_bos*/ true,
-            /*parse_special*/ true);
+    const auto t0 = std::chrono::steady_clock::now();
+    std::string user_prompt = prompt;
     env->ReleaseStringUTFChars(input, prompt);
+    LOGI("generate request: len=%zu preview=\"%s\"",
+         user_prompt.size(), preview_for_log(user_prompt).c_str());
 
-    if (n_tokens <= 0) {
-        LOGE("tokenize failed");
+    reset_generation_long_term_states(true);
+
+    int prompt_tokens = 0;
+    const int predict_len = std::max(1, g_max_new_tokens.load());
+    const auto prefill_t0 = std::chrono::steady_clock::now();
+    if (!process_user_prompt_internal(user_prompt, predict_len, prompt_tokens)) {
+        LOGE("generate: process_user_prompt_internal failed");
         return nullptr;
     }
-    tokens.resize(n_tokens);
+    const auto prefill_t1 = std::chrono::steady_clock::now();
+    const long long prefill_ms = std::chrono::duration_cast<std::chrono::milliseconds>(prefill_t1 - prefill_t0).count();
 
-    const int n_ctx = (int)llama_n_ctx(gen_ctx);
-    if ((int)tokens.size() > n_ctx - 8) truncate_to_ctx(tokens, n_ctx, 8);
-    int cur_pos = 0;
-    if (!prefill_prompt_with_cache(tokens, cur_pos)) {
-        LOGE("decode failed on prompt");
-        return nullptr;
+    const auto gen_t0 = std::chrono::steady_clock::now();
+    std::string out;
+    std::string stop_reason = "predict_cap";
+    int generated_tokens = 0;
+    common_sampler *sampler = create_generation_sampler();
+    while (generate_next_token_internal(sampler, out, stop_reason)) {
+        generated_tokens++;
     }
+    common_sampler_free(sampler);
+    const auto gen_t1 = std::chrono::steady_clock::now();
+    const long long generation_ms = std::chrono::duration_cast<std::chrono::milliseconds>(gen_t1 - gen_t0).count();
 
-    float temperature    = g_temperature.load();
-    float top_p          = g_top_p.load();
-    int   top_k          = g_top_k.load();
-    float repeat_penalty = g_repeat_penalty.load();
-    int   max_new_tokens = g_max_new_tokens.load();
-
-    // NOTE: one-shot generate currently uses fixed sampler params (same as before).
-    llama_sampler *sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(128, repeat_penalty, 0.0f, 0.10f));
-    llama_sampler_chain_add(sampler, llama_sampler_init_top_k(top_k));
-    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(top_p, 1));
-    llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
-    llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
-
-    std::string output;
-    char buf[8192];
-
-    for (int i = 0; i < max_new_tokens; ++i) {
-        llama_token tok = llama_sampler_sample(sampler, gen_ctx, -1);
-        if (tok < 0) break;
-        if (tok == llama_vocab_eos(llama_model_get_vocab(gen_model))) break;
-
-        // early stop on chat EOT
-        char sp[64];
-        int sn = llama_token_to_piece(llama_model_get_vocab(gen_model), tok, sp, (int) sizeof(sp), 0, 1);
-        if (sn > 0) {
-            sp[std::min(sn, (int) sizeof(sp) - 1)] = '\0';
-            if (std::strcmp(sp, "<end_of_turn>") == 0 || std::strcmp(sp, "<|eot_id|>") == 0) break;
-        }
-
-        llama_sampler_accept(sampler, tok);
-
-        int nn = llama_token_to_piece(llama_model_get_vocab(gen_model), tok, buf, (int) sizeof(buf), 0, 0);
-        if (nn > 0) output.append(buf, nn);
-
-        if (cur_pos >= n_ctx) break;
-
-        ensure_step_batch_ready();
-        g_step_batch.n_tokens = 1;
-        g_step_batch.token[0] = tok;
-        g_step_batch.pos[0] = cur_pos++;
-        g_step_batch.n_seq_id[0] = 1;
-        g_step_batch.seq_id[0][0] = 0;
-        g_step_batch.logits[0] = true;
-
-        if (llama_decode(gen_ctx, g_step_batch) != 0) {
-            break;
-        }
-        g_cached_prompt_tokens.push_back(tok);
-    }
-
-    llama_sampler_free(sampler);
-
-    std::string clean = sanitize_generation(output);
-    return env->NewStringUTF(clean.c_str());
+    const auto t1 = std::chrono::steady_clock::now();
+    const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    LOGI("generate perf: prefill=%lld ms prompt_tokens=%d generation=%lld ms generated_tokens=%d stop_reason=%s total=%lld ms",
+         prefill_ms,
+         prompt_tokens,
+         (long long) generation_ms,
+         generated_tokens,
+         stop_reason.c_str(),
+         (long long) total_ms);
+    const std::string final_out = trim(out);
+    LOGI("generate output: len=%zu preview=\"%s\"",
+         final_out.size(), preview_for_log(final_out).c_str());
+    return env->NewStringUTF(final_out.c_str());
 }
 
 extern "C"
 JNIEXPORT jstring JNICALL
 Java_com_llamatik_library_platform_LlamaBridge_generateWithContext(
         JNIEnv *env, jobject, jstring jSystem, jstring jContext, jstring jUser) {
+    if (!gen_ctx || !gen_model) {
+        LOGE("generateWithContext: ctx/model null");
+        return nullptr;
+    }
+    if (!jUser) {
+        LOGE("generateWithContext: user prompt null");
+        return nullptr;
+    }
 
     const char *psys = jSystem ? env->GetStringUTFChars(jSystem, nullptr) : nullptr;
     const char *pctx = jContext ? env->GetStringUTFChars(jContext, nullptr) : nullptr;
@@ -986,18 +1396,69 @@ Java_com_llamatik_library_platform_LlamaBridge_generateWithContext(
     if (jContext) env->ReleaseStringUTFChars(jContext, pctx);
     if (jUser) env->ReleaseStringUTFChars(jUser, pusr);
 
-    if (trim(system).empty()) {
-        system = "You are a careful assistant. Answer ONLY from the provided context. "
-                 "If the context is insufficient, respond exactly: \"I don't have enough information in my sources.\" "
-                 "Write 2–5 short sentences in plain text. Do not use bullets or numbering.";
+    if (trim(system).empty()) system = default_generation_system_prompt();
+    LOGI("generateWithContext request: system_len=%zu context_len=%zu user_len=%zu system_preview=\"%s\" context_preview=\"%s\" user_preview=\"%s\"",
+         system.size(),
+         ctx.size(),
+         user.size(),
+         preview_for_log(system).c_str(),
+         preview_for_log(ctx).c_str(),
+         preview_for_log(user).c_str());
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const size_t signature = make_session_signature(system, ctx);
+    int system_tokens = 0;
+    if (!g_gen_system_ready || g_gen_context_signature != signature) {
+        // Put context into system once so each user turn stays compact and deterministic.
+        std::string system_with_context = system;
+        if (!trim(ctx).empty()) {
+            system_with_context += "\n\nUse the following context:\n" + ctx;
+        }
+        if (!process_system_prompt_internal(system_with_context, system_tokens)) {
+            LOGE("generateWithContext: process_system_prompt_internal failed");
+            return env->NewStringUTF("");
+        }
+        g_gen_context_signature = signature;
+        LOGI("generateWithContext session: reset signature=%zu", signature);
+    } else {
+        LOGI("generateWithContext session: reuse signature=%zu", signature);
     }
 
-    std::string user_turn = build_user_with_context(ctx, user);
-    std::string prompt = build_chat_prompt_gemma(system, user_turn);
-    jstring jp = env->NewStringUTF(prompt.c_str());
-    jstring r = Java_com_llamatik_library_platform_LlamaBridge_generate(env, nullptr, jp);
-    env->DeleteLocalRef(jp);
-    return r;
+    int user_tokens = 0;
+    const int predict_len = std::max(1, g_max_new_tokens.load());
+    const auto prefill_t0 = std::chrono::steady_clock::now();
+    if (!process_user_prompt_internal(user, predict_len, user_tokens)) {
+        LOGE("generateWithContext: process_user_prompt_internal failed");
+        return env->NewStringUTF("");
+    }
+    const auto prefill_t1 = std::chrono::steady_clock::now();
+    const long long prefill_ms = std::chrono::duration_cast<std::chrono::milliseconds>(prefill_t1 - prefill_t0).count();
+
+    const auto gen_t0 = std::chrono::steady_clock::now();
+    std::string out;
+    std::string stop_reason = "predict_cap";
+    int generated_tokens = 0;
+    common_sampler *sampler = create_generation_sampler();
+    while (generate_next_token_internal(sampler, out, stop_reason)) {
+        generated_tokens++;
+    }
+    common_sampler_free(sampler);
+    const auto gen_t1 = std::chrono::steady_clock::now();
+    const long long generation_ms = std::chrono::duration_cast<std::chrono::milliseconds>(gen_t1 - gen_t0).count();
+    const auto t1 = std::chrono::steady_clock::now();
+    const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    LOGI("generateWithContext perf: prefill=%lld ms system_tokens=%d user_tokens=%d generation=%lld ms generated_tokens=%d stop_reason=%s total=%lld ms",
+         prefill_ms,
+         system_tokens,
+         user_tokens,
+         (long long) generation_ms,
+         generated_tokens,
+         stop_reason.c_str(),
+         (long long) total_ms);
+    const std::string final_out = trim(out);
+    LOGI("generateWithContext output: len=%zu preview=\"%s\"",
+         final_out.size(), preview_for_log(final_out).c_str());
+    return env->NewStringUTF(final_out.c_str());
 }
 
 // ---------------- JSON constrained (non-streaming) ----------------
