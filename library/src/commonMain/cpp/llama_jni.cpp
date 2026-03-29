@@ -274,6 +274,10 @@ static void ensure_android_backends_loaded() {
         return count > 0;
     };
 
+    std::string native_lib_dir;
+    bool has_native_lib_dir = false;
+    bool looks_like_apk_internal = false;
+
     Dl_info info{};
     if (dladdr(reinterpret_cast<void *>(&ensure_android_backends_loaded), &info) != 0 && info.dli_fname != nullptr) {
         const std::string so_path(info.dli_fname);
@@ -281,10 +285,11 @@ static void ensure_android_backends_loaded() {
 
         const size_t slash = so_path.find_last_of('/');
         if (slash != std::string::npos && slash > 0) {
-            const std::string native_lib_dir = so_path.substr(0, slash);
+            native_lib_dir = so_path.substr(0, slash);
+            has_native_lib_dir = true;
 
             // On some Android configurations dladdr can return APK-internal paths like "...base.apk!/lib/arm64-v8a".
-            const bool looks_like_apk_internal = native_lib_dir.find('!') != std::string::npos;
+            looks_like_apk_internal = native_lib_dir.find('!') != std::string::npos;
             if (!looks_like_apk_internal) {
                 LOGI("backend-load: trying ggml_backend_load_all_from_path(%s)", native_lib_dir.c_str());
                 ggml_backend_load_all_from_path(native_lib_dir.c_str());
@@ -307,28 +312,42 @@ static void ensure_android_backends_loaded() {
         return;
     }
 
-    // Final fallback: try explicit sonames for Android CPU backend variants.
-    // This helps when path-based scans fail but linker namespace can still resolve by soname.
-    // Prefer higher-capability Android CPU variants first for better performance.
-    const char *cpu_sonames[] = {
-        "libggml-cpu-android_armv9.2_2.so",
-        "libggml-cpu-android_armv9.2_1.so",
-        "libggml-cpu-android_armv9.0_1.so",
-        "libggml-cpu-android_armv8.6_1.so",
-        "libggml-cpu-android_armv8.2_2.so",
-        "libggml-cpu-android_armv8.2_1.so",
-        "libggml-cpu-android_armv8.0_1.so",
-        "libggml-cpu.so",
-    };
-    for (const char *soname : cpu_sonames) {
-        ggml_backend_reg_t reg = ggml_backend_load(soname);
-        LOGI("backend-load: ggml_backend_load(%s) -> %s", soname, reg ? "ok" : "null");
-        if (ggml_backend_reg_count() > 0) {
-            break;
+    // Final fallback: auto-discover ggml backend .so files from native lib directory.
+    if (has_native_lib_dir && !looks_like_apk_internal) {
+        std::vector<std::string> candidate_paths;
+        std::error_code ec;
+        for (const auto &entry : std::filesystem::directory_iterator(native_lib_dir, ec)) {
+            if (ec) {
+                LOGW("backend-load: directory_iterator error on %s: %s",
+                     native_lib_dir.c_str(), ec.message().c_str());
+                break;
+            }
+            if (!entry.is_regular_file(ec)) {
+                if (ec) ec.clear();
+                continue;
+            }
+            const auto filename = entry.path().filename().string();
+            if (filename.rfind("libggml-", 0) == 0 && entry.path().extension() == ".so") {
+                candidate_paths.push_back(entry.path().string());
+            }
         }
+
+        std::sort(candidate_paths.begin(), candidate_paths.end());
+        LOGI("backend-load: discovered %zu ggml backend candidates in %s",
+             candidate_paths.size(), native_lib_dir.c_str());
+        for (const auto &lib_path : candidate_paths) {
+            ggml_backend_reg_t reg = ggml_backend_load(lib_path.c_str());
+            LOGI("backend-load: ggml_backend_load(%s) -> %s",
+                 lib_path.c_str(), reg ? "ok" : "null");
+            if (ggml_backend_reg_count() > 0) {
+                break;
+            }
+        }
+    } else {
+        LOGW("backend-load: skip filesystem fallback (native_lib_dir unavailable or APK-internal)");
     }
 
-    if (!try_log_backends("explicit_soname")) {
+    if (!try_log_backends("filesystem_fallback")) {
         LOGE("backend-load: no ggml backends were loaded after all fallback attempts");
     }
 #endif
