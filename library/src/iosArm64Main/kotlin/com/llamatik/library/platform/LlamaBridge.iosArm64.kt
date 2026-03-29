@@ -14,6 +14,7 @@ import com.llamatik.library.platform.llama.llama_generate_chat
 import com.llamatik.library.platform.llama.llama_generate_chat_json_schema
 import com.llamatik.library.platform.llama.llama_generate_chat_json_schema_stream
 import com.llamatik.library.platform.llama.llama_generate_chat_stream
+import com.llamatik.library.platform.llama.llama_free_ptr
 import com.llamatik.library.platform.llama.llama_generate_free
 import com.llamatik.library.platform.llama.llama_generate_init
 import com.llamatik.library.platform.llama.llama_generate_json_schema
@@ -132,32 +133,33 @@ actual object LlamaBridge {
 
     actual fun initGenerateModel(modelPath: String): Boolean = llama_generate_init(modelPath)
 
+    // Bridge ownership rule:
+    // native generate APIs return an owned C string. We must free it after copying.
+    private fun consumeOwnedText(cstr: CPointer<ByteVar>?): String {
+        if (cstr == null) return ""
+        return try {
+            cstr.toKString()
+        } finally {
+            llama_free_ptr(cstr)
+        }
+    }
+
     actual fun generate(prompt: String): String {
-        val c = llama_generate(prompt) ?: return ""
-        val out = c.toKString()
-        llama_generate_free()
-        return out
+        return consumeOwnedText(llama_generate(prompt))
     }
 
     actual fun generateWithContext(systemPrompt: String, contextBlock: String, userPrompt: String): String {
-        val c = llama_generate_chat(systemPrompt, contextBlock, userPrompt) ?: return ""
-        val out = c.toKString()
-        llama_generate_free()
-        return out
+        return consumeOwnedText(llama_generate_chat(systemPrompt, contextBlock, userPrompt))
     }
 
     actual fun generateJson(prompt: String, jsonSchema: String?): String {
-        val c = llama_generate_json_schema(prompt, jsonSchema) ?: return ""
-        val out = c.toKString()
-        llama_generate_free()
-        return out
+        return consumeOwnedText(llama_generate_json_schema(prompt, jsonSchema))
     }
 
     actual fun generateJsonWithContext(systemPrompt: String, contextBlock: String, userPrompt: String, jsonSchema: String?): String {
-        val c = llama_generate_chat_json_schema(systemPrompt, contextBlock, userPrompt, jsonSchema) ?: return ""
-        val out = c.toKString()
-        llama_generate_free()
-        return out
+        return consumeOwnedText(
+            llama_generate_chat_json_schema(systemPrompt, contextBlock, userPrompt, jsonSchema)
+        )
     }
 
     actual fun shutdown() {

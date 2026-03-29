@@ -1142,4 +1142,14 @@ void llama_generate_free() {
     }
 }
 
+void llama_free_ptr(void *ptr) {
+    if (ptr) {
+        std::free(ptr);
+    }
+}
+
+void llama_free_cstr(char *ptr) {
+    llama_free_ptr(static_cast<void *>(ptr));
+}
+
 } // extern "C"

@@ -8,6 +8,15 @@ extern "C" {
   #include <stdbool.h>   // C99 'bool', 'true', 'false'
 #endif
 
+// ================= Memory ownership contract =================
+//
+// 1) Any API that returns a pointer allocated by this library transfers ownership
+//    to the caller. The caller must eventually release that pointer.
+// 2) Use llama_free_ptr(...) as the generic deallocator for memory allocated by
+//    this library (char*, float*, and other pointer payloads that are documented
+//    as owned-return values).
+// 3) llama_free_cstr(...) is kept only as a backward-compatible alias.
+//
 // ================= Embeddings =================
 
 /**
@@ -89,6 +98,9 @@ char *llama_generate_chat_json_schema(const char *system_prompt,
  * Free all text generation-related resources.
  */
 void llama_generate_free(void);
+void llama_free_ptr(void *ptr);
+// Backward-compatible alias for string pointers.
+void llama_free_cstr(char *ptr);
 
 // ================= Text Generation (streaming) =================
 //
