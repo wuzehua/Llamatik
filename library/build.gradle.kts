@@ -6,6 +6,7 @@ import org.gradle.api.file.RegularFileProperty
 import org.gradle.api.provider.Property
 import org.gradle.api.tasks.Input
 import org.gradle.api.tasks.InputDirectory
+import org.gradle.api.tasks.InputFile
 import org.gradle.api.tasks.OutputDirectory
 import org.gradle.api.tasks.OutputFile
 import org.gradle.api.tasks.PathSensitive
@@ -138,6 +139,35 @@ abstract class MergeLlamaStaticTask : DefaultTask() {
     }
 }
 
+abstract class EmbedNativeLibTask : DefaultTask() {
+    @get:Input
+    abstract val libtoolPath: Property<String>
+
+    @get:InputFile
+    @get:PathSensitive(PathSensitivity.ABSOLUTE)
+    abstract val mergedLib: RegularFileProperty
+
+    @get:OutputFile
+    abstract val frameworkBinary: RegularFileProperty
+
+    @get:Inject
+    abstract val execOperations: ExecOperations
+
+    @TaskAction
+    fun embed() {
+        val fwFile = frameworkBinary.get().asFile
+        val mergedFile = mergedLib.get().asFile
+        val tmpOutput = File(fwFile.parentFile, "llamatik.merged.a")
+        execOperations.exec {
+            executable = libtoolPath.get()
+            args("-static", "-o", tmpOutput.absolutePath, fwFile.absolutePath, mergedFile.absolutePath)
+        }
+        fwFile.delete()
+        tmpOutput.renameTo(fwFile)
+        logger.lifecycle("Embedded native library into ${fwFile.absolutePath}")
+    }
+}
+
 plugins {
     alias(libs.plugins.kotlinMultiplatform)
     alias(libs.plugins.compose.compiler)
@@ -249,11 +279,6 @@ kotlin {
             mergedLib.set(layout.buildDirectory.file("llama-cmake/$sdkValue/${arch.name}/libllama_merged.a"))
         }
 
-        // Ensure cinterop runs after the native libs are built/merged
-        tasks.withType<org.jetbrains.kotlin.gradle.tasks.CInteropProcess>().configureEach {
-            dependsOn(mergeTask)
-        }
-
         arch.compilations.getByName("main").cinterops {
             create("llama") {
                 val defFileName = "llama_ios.def"
@@ -262,14 +287,6 @@ kotlin {
                 packageName("com.llamatik.library.platform.llama")
 
                 compilerOpts("-I${projectDir}/src/iosMain/c_interop/include")
-
-                extraOpts(
-                    "-libraryPath", libPath
-                )
-
-                tasks.named(interopProcessingTaskName).configure {
-                    dependsOn(mergeTask)
-                }
             }
 
             create("whisper") {
@@ -279,15 +296,15 @@ kotlin {
                 packageName("com.llamatik.library.platform.whisper")
 
                 compilerOpts("-I${projectDir}/src/iosMain/c_interop/include")
-
-                extraOpts(
-                    "-libraryPath", libPath
-                )
-
-                tasks.named(interopProcessingTaskName).configure {
-                    dependsOn(mergeTask)
-                }
             }
+        }
+
+        val targetName = arch.name.replaceFirstChar { it.uppercase() }
+        tasks.matching { it.name == "linkDebugFramework$targetName" }.configureEach {
+            dependsOn(mergeTask)
+        }
+        tasks.matching { it.name == "linkReleaseFramework$targetName" }.configureEach {
+            dependsOn(mergeTask)
         }
 
         val merged = "$libPath/libllama_merged.a"
@@ -321,6 +338,27 @@ kotlin {
                 else
                     "-mios-version-min=$minIosVersion"
             )
+        }
+
+        // After the framework is built, merge libllama_merged.a into the
+        // framework binary so that the static framework is self-contained.
+        // Kotlin/Native static frameworks leave native symbols as U (undefined)
+        // even with -Wl,-force_load; the consumer would otherwise need to
+        // link the native library separately.
+        listOf("Debug", "Release").forEach { buildType ->
+            val embedTaskName = "embedLlamaNative${buildType}${targetName}"
+            val fwBinary = layout.buildDirectory.file(
+                "bin/${arch.name}/${buildType.lowercase()}Framework/llamatik.framework/llamatik"
+            )
+            tasks.register(embedTaskName, EmbedNativeLibTask::class) {
+                libtoolPath.set(libtoolExecutablePath)
+                mergedLib.set(mergeTask.flatMap { it.mergedLib })
+                frameworkBinary.set(fwBinary)
+                dependsOn("link${buildType}Framework$targetName", mergeTask)
+            }
+            tasks.matching { it.name == "link${buildType}Framework$targetName" }.configureEach {
+                finalizedBy(embedTaskName)
+            }
         }
     }
 
