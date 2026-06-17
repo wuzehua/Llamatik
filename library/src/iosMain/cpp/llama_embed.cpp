@@ -16,6 +16,7 @@
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
+#include <unistd.h>  // sysconf for CPU count
 #else
 #define TARGET_OS_SIMULATOR 0
 #endif
@@ -55,11 +56,25 @@ static bool g_backend_inited = false;
 static std::atomic<bool> g_cancel_requested{false};
 
 // Generation parameters (atomic for safe update while app is running)
-static std::atomic<float> g_temperature{0.55f};
+// Aligned with Android defaults (llama_jni.cpp) for consistent translation quality.
+static std::atomic<float> g_temperature{0.30f};
 static std::atomic<int>   g_max_tokens{256};     // align with app default
 static std::atomic<float> g_top_p{0.95f};
 static std::atomic<int>   g_top_k{40};
-static std::atomic<float> g_repeat_penalty{1.10f};
+static std::atomic<float> g_repeat_penalty{1.00f};
+
+// Thread tuning — mirrors Android's compute_android_inference_threads() strategy.
+constexpr int N_THREADS_MIN = 2;
+constexpr int N_THREADS_MAX = 4;
+constexpr int N_THREADS_HEADROOM = 2;
+constexpr int DEFAULT_N_BATCH = 512;
+
+static int compute_ios_inference_threads() {
+    const long cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
+    const int guessed = static_cast<int>(cpu_count > 0 ? cpu_count : N_THREADS_MAX) - N_THREADS_HEADROOM;
+    const int n_threads = std::max(N_THREADS_MIN, std::min(N_THREADS_MAX, guessed));
+    return n_threads;
+}
 
 // ===================== Helpers =====================
 
@@ -475,7 +490,11 @@ bool llama_generate_init(const char *model_path) {
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.embeddings = false;
-    ctx_params.n_ctx      = 8192;   // larger context
+    ctx_params.n_ctx      = 4096;               // align with Android
+    ctx_params.n_batch    = DEFAULT_N_BATCH;    // 512, align with Android
+    ctx_params.n_ubatch   = DEFAULT_N_BATCH;    // 512, align with Android
+    ctx_params.n_threads  = compute_ios_inference_threads();
+    ctx_params.n_threads_batch = ctx_params.n_threads;
 
     gen_ctx = llama_init_from_model(gen_model, ctx_params);
     if (!gen_ctx) {
@@ -501,11 +520,12 @@ char *llama_generate(const char *prompt) {
 
     llama_memory_clear(llama_get_memory(gen_ctx), false);
 
-    // We treat `prompt` we receive as the *Question* and build our wrapper.
-    std::string wrapped;
-    if (!apply_chat_template_if_available(nullptr, prompt, wrapped)) {
-        wrapped = build_plain_prompt(/*context=*/"", /*question=*/prompt);
-    }
+    // Align with Android: use prompt as-is.
+    // Android's process_user_prompt_internal uses the raw prompt when no chat template
+    // is available. TranslateApp's TranslationHelper already builds a complete instruction,
+    // so we must NOT wrap it in "Question:\n{prompt}\n\nAnswer:\n" — that would corrupt
+    // the translation instruction's semantics.
+    std::string wrapped = prompt ? prompt : "";
 
     // 2) Tokenize + prompt decode
     const llama_vocab *v = llama_model_get_vocab(gen_model);
