@@ -916,13 +916,8 @@ void llama_generate_stream(const char *prompt,
 
     g_cancel_requested.store(false, std::memory_order_relaxed);
 
-    llama_memory_clear(llama_get_memory(gen_ctx), false);
-
-    // Wrap incoming prompt as Question only (no system echo)
-    std::string wrapped;
-    if (!apply_chat_template_if_available(nullptr, prompt, wrapped)) {
-        wrapped = build_plain_prompt(/*context=*/"", /*question=*/prompt);
-    }
+    // Align with llama_generate: use prompt as-is (no Question/Answer wrapper).
+    std::string wrapped = prompt ? prompt : "";
 
     std::vector<llama_token> tokens(2048);
     int n_tokens = tokenize_with_retry(llama_model_get_vocab(gen_model),
@@ -936,25 +931,15 @@ void llama_generate_stream(const char *prompt,
         truncate_to_ctx(tokens, (int)n_ctx, 8);
     }
 
-    llama_batch batch = llama_batch_init((int)tokens.size(), 0, 1);
-    batch.n_tokens = (int)tokens.size();
-    for (int i = 0; i < batch.n_tokens; ++i) {
-        batch.token[i]     = tokens[i];
-        batch.pos[i]       = i;
-        batch.n_seq_id[i]  = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i]    = (i == batch.n_tokens - 1);
-    }
-
-    if (llama_decode(gen_ctx, batch) != 0) {
-        llama_batch_free(batch);
-        if (on_error) on_error("decode failed", user);
+    // Prefill with prompt prefix reuse — align with llama_generate.
+    if (!prefill_prompt_with_cache(tokens, g_gen_current_position)) {
+        if (on_error) on_error("prefill failed", user);
         return;
     }
+    const int system_prompt_position = 0;
 
     llama_sampler *sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
     if (!sampler) {
-        llama_batch_free(batch);
         if (on_error) on_error("sampler init failed", user);
         return;
     }
@@ -966,9 +951,8 @@ void llama_generate_stream(const char *prompt,
 
     const llama_vocab *v = llama_model_get_vocab(gen_model);
 
-    int cur_pos = batch.n_tokens;
     const int safety = 16;
-    int remaining_ctx = (int)n_ctx - cur_pos - safety;
+    int remaining_ctx = (int)n_ctx - g_gen_current_position - safety;
     if (remaining_ctx < 0) remaining_ctx = 0;
 
     // IMPORTANT: limit to what's left in ctx AND the user-configured max_tokens
@@ -984,6 +968,14 @@ void llama_generate_stream(const char *prompt,
         if (g_cancel_requested.load(std::memory_order_relaxed)) {
             DBG("stream: cancelled at token %d", i);
             break;
+        }
+
+        // Shift context if nearly full (KV cache sliding window)
+        if (g_gen_current_position >= (int)n_ctx - safety) {
+            if (!shift_generation_context(system_prompt_position)) {
+                DBG("stream: context full and shift failed");
+                break;
+            }
         }
 
         llama_token tok = llama_sampler_sample(sampler, gen_ctx, -1);
@@ -1027,12 +1019,12 @@ void llama_generate_stream(const char *prompt,
             }
         }
 
-        if (cur_pos >= (int)n_ctx) break;
+        if (g_gen_current_position >= (int)n_ctx) break;
 
         llama_batch step = llama_batch_init(1, 0, 1);
         step.n_tokens      = 1;
         step.token[0]      = tok;
-        step.pos[0]        = cur_pos;
+        step.pos[0]        = g_gen_current_position;
         step.n_seq_id[0]   = 1;
         step.seq_id[0][0]  = 0;
         step.logits[0]     = true;
@@ -1040,11 +1032,10 @@ void llama_generate_stream(const char *prompt,
             llama_batch_free(step);
             break;
         }
-        cur_pos++;
+        g_gen_current_position++;
         llama_batch_free(step);
     }
 
-    llama_batch_free(batch);
     llama_sampler_free(sampler);
 
     if (on_done) on_done(user);
