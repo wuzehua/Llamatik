@@ -55,6 +55,10 @@ static struct llama_context *gen_ctx    = nullptr;
 static bool g_backend_inited = false;
 static std::atomic<bool> g_cancel_requested{false};
 
+// Prompt prefix reuse state — mirrors Android's g_cached_prompt_tokens.
+static std::vector<llama_token> g_cached_prompt_tokens;
+static int g_gen_current_position = 0;
+
 // Generation parameters (atomic for safe update while app is running)
 // Aligned with Android defaults (llama_jni.cpp) for consistent translation quality.
 static std::atomic<float> g_temperature{0.30f};
@@ -478,6 +482,92 @@ void llama_embed_free() {
 
 // ===================== Text Generation =====================
 
+static void reset_prompt_cache() {
+    g_cached_prompt_tokens.clear();
+    g_gen_current_position = 0;
+}
+
+// Reuse already-decoded prefix across requests when prompts share a common token prefix.
+// Ported from Android's prefill_prompt_with_cache (llama_jni.cpp).
+static bool prefill_prompt_with_cache(
+        const std::vector<llama_token> &prompt_tokens,
+        int &out_cur_pos) {
+    if (!gen_ctx || prompt_tokens.empty()) return false;
+
+    llama_memory_t mem = llama_get_memory(gen_ctx);
+
+    size_t lcp = 0;
+    const size_t n_prev = g_cached_prompt_tokens.size();
+    const size_t n_now = prompt_tokens.size();
+    while (lcp < n_prev && lcp < n_now && g_cached_prompt_tokens[lcp] == prompt_tokens[lcp]) {
+        ++lcp;
+    }
+
+    // Full-prefix reuse needs one token re-decode to refresh "last logits" for sampling.
+    if (lcp == n_now && n_now > 0) {
+        lcp = n_now - 1;
+    }
+
+    if (n_prev > 0) {
+        if (lcp == 0) {
+            llama_memory_clear(mem, false);
+        } else if (lcp < n_prev) {
+            const bool rm_ok = llama_memory_seq_rm(mem, /*seq_id*/ 0, (llama_pos) lcp, -1);
+            if (!rm_ok) {
+                DBG("prefill-cache: seq_rm failed (lcp=%zu prev=%zu), full clear", lcp, n_prev);
+                llama_memory_clear(mem, false);
+                lcp = 0;
+            }
+        }
+    }
+
+    const int n_batch_limit = std::max(1, DEFAULT_N_BATCH);
+    for (size_t i = lcp; i < n_now; i += (size_t) n_batch_limit) {
+        const int cur = (int) std::min((size_t) n_batch_limit, n_now - i);
+        llama_batch batch = llama_batch_init(cur, 0, 1);
+        batch.n_tokens = cur;
+
+        for (int j = 0; j < cur; ++j) {
+            const size_t idx = i + (size_t) j;
+            batch.token[j] = prompt_tokens[idx];
+            batch.pos[j] = (llama_pos) idx;
+            batch.n_seq_id[j] = 1;
+            batch.seq_id[j][0] = 0;
+            batch.logits[j] = (idx + 1 == n_now);
+        }
+
+        const int decode_rc = llama_decode(gen_ctx, batch);
+        llama_batch_free(batch);
+        if (decode_rc != 0) {
+            DBG("prefill-cache: llama_decode failed rc=%d at token_idx=%zu", decode_rc, i);
+            llama_memory_clear(mem, false);
+            reset_prompt_cache();
+            return false;
+        }
+    }
+
+    g_cached_prompt_tokens = prompt_tokens;
+    out_cur_pos = (int) n_now;
+    DBG("prefill-cache: prompt=%zu prev=%zu reused=%zu decoded=%zu",
+        n_now, n_prev, lcp, n_now - lcp);
+    return true;
+}
+
+// Shift generation context when ctx is nearly full — discards oldest half after system prompt.
+// Ported from Android's shift_generation_context (llama_jni.cpp).
+static bool shift_generation_context(int system_prompt_position) {
+    if (!gen_ctx) return false;
+    if (g_gen_current_position <= system_prompt_position + 1) return false;
+    const int n_discard = (g_gen_current_position - system_prompt_position) / 2;
+    if (n_discard <= 0) return false;
+    DBG("generate: shifting context, discard=%d", n_discard);
+    auto mem = llama_get_memory(gen_ctx);
+    llama_memory_seq_rm(mem, 0, system_prompt_position, system_prompt_position + n_discard);
+    llama_memory_seq_add(mem, 0, system_prompt_position + n_discard, g_gen_current_position, -n_discard);
+    g_gen_current_position -= n_discard;
+    return true;
+}
+
 bool llama_generate_init(const char *model_path) {
     dbg_init();
     if (!g_backend_inited) {
@@ -487,6 +577,8 @@ bool llama_generate_init(const char *model_path) {
 
     gen_model = load_model_with_fallback(model_path);
     if (!gen_model) return false;
+
+    reset_prompt_cache();
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.embeddings = false;
@@ -518,8 +610,6 @@ char *llama_generate(const char *prompt) {
 
     g_cancel_requested.store(false, std::memory_order_relaxed);
 
-    llama_memory_clear(llama_get_memory(gen_ctx), false);
-
     // Align with Android: use prompt as-is.
     // Android's process_user_prompt_internal uses the raw prompt when no chat template
     // is available. TranslateApp's TranslationHelper already builds a complete instruction,
@@ -527,7 +617,7 @@ char *llama_generate(const char *prompt) {
     // the translation instruction's semantics.
     std::string wrapped = prompt ? prompt : "";
 
-    // 2) Tokenize + prompt decode
+    // 2) Tokenize
     const llama_vocab *v = llama_model_get_vocab(gen_model);
     std::vector<llama_token> tokens(2048);
     int n_tokens = tokenize_with_retry(v, wrapped.c_str(), tokens, /*add_bos*/ true, /*parse_special*/ true);
@@ -540,26 +630,18 @@ char *llama_generate(const char *prompt) {
         DBG("generate: prompt truncated");
     }
 
-    llama_batch batch = llama_batch_init((int)tokens.size(), 0, 1);
-    batch.n_tokens = (int)tokens.size();
-    for (int i = 0; i < batch.n_tokens; ++i) {
-        batch.token[i]     = tokens[i];
-        batch.pos[i]       = i;
-        batch.n_seq_id[i]  = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i]    = (i == batch.n_tokens - 1);
-    }
-
-    if (llama_decode(gen_ctx, batch) != 0) {
-        llama_batch_free(batch);
-        DBG("generate: decode prompt failed");
+    // Prefill with prompt prefix reuse — avoids re-decoding tokens that match the
+    // previous request's prefix (e.g. the translation instruction header).
+    if (!prefill_prompt_with_cache(tokens, g_gen_current_position)) {
+        DBG("generate: prefill failed");
         return nullptr;
     }
+    // system_prompt_position = 0 for the non-chat-template path; shift discards from pos 0.
+    const int system_prompt_position = 0;
 
     // Sampler
     llama_sampler *sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
     if (!sampler) {
-        llama_batch_free(batch);
         return nullptr;
     }
     llama_sampler_chain_add(sampler, llama_sampler_init_penalties(128, repeat_penalty, 0.0f, 0.10f));
@@ -570,9 +652,8 @@ char *llama_generate(const char *prompt) {
 
     // 3) Decode loop
     std::vector<llama_token> out;
-    int cur_pos = batch.n_tokens;
     const int safety = 16;
-    int remaining_ctx = (int)n_ctx - cur_pos - safety;
+    int remaining_ctx = (int)n_ctx - g_gen_current_position - safety;
     if (remaining_ctx < 0) remaining_ctx = 0;
 
     // IMPORTANT: limit to what's left in ctx AND the user-configured max_tokens
@@ -584,6 +665,14 @@ char *llama_generate(const char *prompt) {
             break;
         }
 
+        // Shift context if nearly full (KV cache sliding window)
+        if (g_gen_current_position >= (int)n_ctx - safety) {
+            if (!shift_generation_context(system_prompt_position)) {
+                DBG("generate: context full and shift failed");
+                break;
+            }
+        }
+
         llama_token tok = llama_sampler_sample(sampler, gen_ctx, -1);
         if (tok < 0) break;
         if (llama_vocab_is_eog(v, tok)) {
@@ -591,7 +680,7 @@ char *llama_generate(const char *prompt) {
             break;
         }
 
-        // Early stop on common “end” pieces
+        // Early stop on common "end" pieces
         char piece[64];
         int nn = llama_token_to_piece(v, tok, piece, (int)sizeof(piece), 0, /*special*/ true);
         if (nn > 0) {
@@ -609,29 +698,23 @@ char *llama_generate(const char *prompt) {
         llama_sampler_accept(sampler, tok);
         out.push_back(tok);
 
-        if (cur_pos >= (int)n_ctx) {
-            DBG("generate: context full at %d positions", cur_pos);
-            break;
-        }
-
         llama_batch step = llama_batch_init(1, 0, 1);
         step.n_tokens      = 1;
         step.token[0]      = tok;
-        step.pos[0]        = cur_pos;
+        step.pos[0]        = g_gen_current_position;
         step.n_seq_id[0]   = 1;
         step.seq_id[0][0]  = 0;
         step.logits[0]     = true;
 
         if (llama_decode(gen_ctx, step) != 0) {
-            DBG("generate: decode step failed at pos=%d", cur_pos);
+            DBG("generate: decode step failed at pos=%d", g_gen_current_position);
             llama_batch_free(step);
             break;
         }
-        cur_pos++;
+        g_gen_current_position++;
         llama_batch_free(step);
     }
 
-    llama_batch_free(batch);
     llama_sampler_free(sampler);
 
     // 4) Detokenize
