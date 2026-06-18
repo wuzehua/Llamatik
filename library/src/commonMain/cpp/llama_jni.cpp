@@ -1585,24 +1585,24 @@ static void stream_from_prompt(
     // Reset cancel flag at the start of each stream
     g_cancel_requested.store(false, std::memory_order_relaxed);
 
-    std::vector<llama_token> tokens(2048);
-    int n_tokens = tokenize_with_retry(llama_model_get_vocab(gen_model),
-            prompt, tokens,
-            /*add_bos*/ true,
-            /*parse_special*/ true);
-    if (n_tokens <= 0) {
-        env->CallVoidMethod(jCallback, m.onError, env->NewStringUTF("tokenization failed"));
-        return;
+    // 彻底重置状态：清空 KV cache、prompt cache、chat history、位置。
+    // 必须用 reset_generation_prompt_cache() 而非 reset_generation_long_term_states()，
+    // 因为后者不清 g_cached_prompt_tokens，会导致 prefill_prompt_with_cache 的前缀匹配
+    // 基于过期的缓存，在 KV cache 已清空的情况下产生不一致。
+    reset_generation_prompt_cache();
+    if (gen_ctx) {
+        llama_memory_clear(llama_get_memory(gen_ctx), false);
     }
-    tokens.resize(n_tokens);
 
-    const int n_ctx = (int)llama_n_ctx(gen_ctx);
-    if ((int)tokens.size() > n_ctx - 8) truncate_to_ctx(tokens, n_ctx, 8);
-    int cur_pos = 0;
-    if (!prefill_prompt_with_cache(tokens, cur_pos)) {
-        env->CallVoidMethod(jCallback, m.onError, env->NewStringUTF("llama_decode failed on prompt"));
+    // 对齐 process_user_prompt_internal：如果有 chat template，用 chat 格式化 prompt
+    // 直接复用 process_user_prompt_internal 做 prefill，确保 tokenize + decode 路径完全一致
+    const int predict_len = std::max(1, g_max_new_tokens.load());
+    int prompt_tokens = 0;
+    if (!process_user_prompt_internal(std::string(prompt), predict_len, prompt_tokens)) {
+        env->CallVoidMethod(jCallback, m.onError, env->NewStringUTF("process_user_prompt failed"));
         return;
     }
+    int cur_pos = g_gen_current_position;
 
     float temperature    = g_temperature.load();
     float top_p          = g_top_p.load();
@@ -1612,74 +1612,118 @@ static void stream_from_prompt(
 
     const llama_vocab *vocab = llama_model_get_vocab(gen_model);
 
-    llama_sampler *sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
-
-    // IMPORTANT: grammar must be first in the chain so it can veto invalid tokens.
+    // 对齐 generate：用 create_generation_sampler 创建 sampler（common_sampler_init）
+    // grammar 场景仍用手动 chain（common_sampler 不支持 grammar 参数）
+    common_sampler *sampler;
     if (grammar_gbnf && grammar_gbnf[0]) {
-        llama_sampler_chain_add(sampler, llama_sampler_init_grammar(vocab, grammar_gbnf, "root"));
+        llama_sampler *chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        llama_sampler_chain_add(chain, llama_sampler_init_grammar(vocab, grammar_gbnf, "root"));
+        llama_sampler_chain_add(chain, llama_sampler_init_penalties(128, repeat_penalty, 0.0f, 0.10f));
+        llama_sampler_chain_add(chain, llama_sampler_init_top_k(top_k));
+        llama_sampler_chain_add(chain, llama_sampler_init_top_p(top_p, 1));
+        llama_sampler_chain_add(chain, llama_sampler_init_temp(temperature));
+        llama_sampler_chain_add(chain, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+        // common_sampler 和 llama_sampler* 不兼容，grammar 场景用 raw chain
+        sampler = nullptr;
+        // 用 raw chain 路径
+        char piece_buf[768];
+        char spec_buf[64];
+        for (int i = 0; i < max_new_tokens; ++i) {
+            if (g_cancel_requested.load(std::memory_order_relaxed)) break;
+            if (g_gen_current_position >= g_gen_stop_generation_position) break;
+            if (g_gen_current_position >= (int)llama_n_ctx(gen_ctx) - GEN_OVERFLOW_HEADROOM) {
+                if (!shift_generation_context()) break;
+            }
+            llama_token tok = llama_sampler_sample(chain, gen_ctx, -1);
+            if (tok < 0) break;
+            if (llama_vocab_is_eog(vocab, tok)) {
+                if (!g_gen_assistant_ss.str().empty()) {
+                    (void) generation_chat_add_and_format(ROLE_ASSISTANT, g_gen_assistant_ss.str());
+                }
+                break;
+            }
+            llama_sampler_accept(chain, tok);
+            int nn = llama_token_to_piece(vocab, tok, piece_buf, (int)sizeof(piece_buf), 0, /*special*/ 0);
+            if (nn > 0) {
+                piece_buf[std::min(nn, (int)sizeof(piece_buf) - 1)] = '\0';
+                g_gen_assistant_ss << piece_buf;
+                jstring delta = env->NewStringUTF(piece_buf);
+                if (delta) { env->CallVoidMethod(jCallback, m.onDelta, delta); env->DeleteLocalRef(delta); }
+            }
+            ensure_gen_batch_ready();
+            common_batch_clear(g_gen_batch);
+            common_batch_add(g_gen_batch, tok, g_gen_current_position, {0}, true);
+            if (llama_decode(gen_ctx, g_gen_batch) != 0) break;
+            g_gen_current_position++;
+        }
+        llama_sampler_free(chain);
+        env->CallVoidMethod(jCallback, m.onComplete);
+        return;
     }
 
-    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(128, repeat_penalty, 0.0f, 0.10f));
-    llama_sampler_chain_add(sampler, llama_sampler_init_top_k(top_k));
-    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(top_p, 1));
-    llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
-    llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+    sampler = create_generation_sampler();
 
-    char piece_buf[768];
-    char spec_buf[64];
-
-    for (int i = 0; i < max_new_tokens; ++i) {
+    // 对齐 generate_next_token_internal 的 decode 循环
+    std::string stop_reason = "predict_cap";
+    while (true) {
         if (g_cancel_requested.load(std::memory_order_relaxed)) {
+            stop_reason = "cancelled";
             break;
         }
-
-        llama_token tok = llama_sampler_sample(sampler, gen_ctx, -1);
-        if (tok < 0) break;
-        if (tok == llama_vocab_eos(vocab)) break;
-
-        int sn = llama_token_to_piece(vocab,
-                tok, spec_buf, (int) sizeof(spec_buf),
-                /* lstrip */ 0, /* special */ 1);
-        if (sn > 0) {
-            spec_buf[std::min(sn, (int) sizeof(spec_buf) - 1)] = '\0';
-            if (is_eot_piece(spec_buf) || std::strcmp(spec_buf, "<start_of_turn>") == 0) {
+        // context shift 检查（对齐 generate_next_token_internal）
+        const int n_ctx = (int) llama_n_ctx(gen_ctx);
+        if (g_gen_current_position >= n_ctx - GEN_OVERFLOW_HEADROOM) {
+            if (!shift_generation_context()) {
+                stop_reason = "ctx_limit";
                 break;
             }
         }
+        // predict_cap 检查（对齐 generate_next_token_internal）
+        if (g_gen_current_position >= g_gen_stop_generation_position) {
+            stop_reason = "predict_cap";
+            break;
+        }
 
-        llama_sampler_accept(sampler, tok);
+        const llama_token tok = common_sampler_sample(sampler, gen_ctx, -1);
+        common_sampler_accept(sampler, tok, true);
 
-        int nn = llama_token_to_piece(vocab,
-                tok, piece_buf, (int) sizeof(piece_buf),
-                /* lstrip */ 0, /* special */ 0);
-        if (nn > 0) {
-            piece_buf[std::min(nn, (int) sizeof(piece_buf) - 1)] = '\0';
-            jstring delta = env->NewStringUTF(piece_buf);
+        ensure_gen_batch_ready();
+        common_batch_clear(g_gen_batch);
+        common_batch_add(g_gen_batch, tok, g_gen_current_position, {0}, true);
+        if (llama_decode(gen_ctx, g_gen_batch) != 0) {
+            env->CallVoidMethod(jCallback, m.onError, env->NewStringUTF("llama_decode failed mid-stream"));
+            common_sampler_free(sampler);
+            return;
+        }
+        g_gen_current_position++;
+
+        // EOG 检测（对齐 generate_next_token_internal）
+        if (llama_vocab_is_eog(vocab, tok)) {
+            stop_reason = "eog";
+            if (!g_gen_assistant_ss.str().empty()) {
+                (void) generation_chat_add_and_format(ROLE_ASSISTANT, g_gen_assistant_ss.str());
+            }
+            break;
+        }
+
+        // 输出 piece（对齐 generate_next_token_internal 的 UTF-8 缓冲逻辑）
+        const auto piece = common_token_to_piece(gen_ctx, tok);
+        g_gen_cached_token_chars += piece;
+        if (is_valid_utf8(g_gen_cached_token_chars.c_str())) {
+            const std::string &delta_str = g_gen_cached_token_chars;
+            g_gen_assistant_ss << delta_str;
+            jstring delta = env->NewStringUTF(delta_str.c_str());
             if (delta) {
                 env->CallVoidMethod(jCallback, m.onDelta, delta);
                 env->DeleteLocalRef(delta);
             }
+            g_gen_cached_token_chars.clear();
         }
-
-        if (cur_pos >= n_ctx) break;
-
-        ensure_step_batch_ready();
-        g_step_batch.n_tokens = 1;
-        g_step_batch.token[0] = tok;
-        g_step_batch.pos[0] = cur_pos++;
-        g_step_batch.n_seq_id[0] = 1;
-        g_step_batch.seq_id[0][0] = 0;
-        g_step_batch.logits[0] = true;
-
-        if (llama_decode(gen_ctx, g_step_batch) != 0) {
-            env->CallVoidMethod(jCallback, m.onError, env->NewStringUTF("llama_decode failed mid-stream"));
-            llama_sampler_free(sampler);
-            return;
-        }
-        g_cached_prompt_tokens.push_back(tok);
     }
 
-    llama_sampler_free(sampler);
+    LOGI("stream: stop_reason=%s", stop_reason.c_str());
+
+    common_sampler_free(sampler);
 
     // Always signal completion – Kotlin side will ignore if it has nulled activeRequestId
     env->CallVoidMethod(jCallback, m.onComplete);
